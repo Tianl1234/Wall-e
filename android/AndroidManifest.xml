@@ -1,24 +1,57 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Wall-E as an Android chess engine package — no user interface.
+
+    There is deliberately no android.intent.category.LAUNCHER anywhere in this file:
+    the package has no icon, appears in no launcher and cannot be "opened". It is
+    discovered by chess GUIs through the Open Exchange (OEX) convention:
+
+      * an activity advertising the action  intent.chess.provider.ENGINE, whose
+        meta-data names the ContentProvider authority, and
+      * res/xml/enginelist.xml, which lists the engine binaries and the ABIs they
+        support, and
+      * the engine itself as  lib/<abi>/libwalle.so, so Android's package manager
+        extracts it into the app's nativeLibraryDir, where it is executable even on
+        Android 10+ (files in app-writable data directories are not).
+
+    The binary is an ordinary UCI program; the ".so" name only exists so the package
+    manager treats it as a native library.
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.tianl1234.walle"
-    android:versionCode="2"
-    android:versionName="1.1">
+    android:versionCode="3"
+    android:versionName="1.2">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
     <application
-        android:label="Wall-E"
-        android:icon="@drawable/ic_launcher"
+        android:label="Wall-E Chess Engine"
         android:allowBackup="false"
-        android:extractNativeLibs="true"
-        android:theme="@android:style/Theme.DeviceDefault">
+        android:extractNativeLibs="true">
 
+        <!-- Marker activity: GUIs query for the ENGINE action to find providers.
+             It has no UI and finishes immediately. -->
         <activity
-            android:name=".MainActivity"
+            android:name=".EngineActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode">
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="intent.chess.provider.ENGINE" />
+            </intent-filter>
+            <meta-data
+                android:name="chess.provider.engine.authority"
+                android:value="com.tianl1234.walle.EngineProvider" />
         </activity>
+
+        <!-- Serves the engine binary (assets first, then nativeLibraryDir), for GUIs
+             that copy the engine out of the package instead of executing it in place. -->
+        <provider
+            android:name=".EngineProvider"
+            android:authorities="com.tianl1234.walle.EngineProvider"
+            android:exported="true" />
     </application>
 </manifest>

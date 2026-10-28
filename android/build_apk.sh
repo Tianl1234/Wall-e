@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Builds build/Wall-E-console.apk without Gradle.
+# Builds build/Wall-E-engine.apk: a chess ENGINE package with no user interface.
 #
-# Pipeline: NDK clang++ (native engine, one build per ABI) -> javac -> d8 ->
-# aapt2 -> jar -> zipalign -> apksigner. Every tool is from the Android SDK /
-# JDK, so the build needs no Maven downloads and no Android Studio.
+# It follows the Open Exchange (OEX) convention used by Android engine packages
+# (Stockfish, Patricia, Ethereal, ...): no launcher activity, an activity advertising
+# intent.chess.provider.ENGINE, res/xml/enginelist.xml, and the engine itself as
+# lib/<abi>/libwalle.so so the package manager extracts it into nativeLibraryDir.
 #
-# The APK is universal: arm64 phones use arm64-v8a, x86_64 emulators and
-# Chromebooks use x86_64. A missing ABI is the failure mode where the app
-# installs but then reports that the engine binary is missing.
+# Pipeline: NDK clang++ (engine, NNUE embedded) -> javac -> d8 -> aapt2 -> jar ->
+# zipalign -> apksigner. No Gradle, no Android Studio, no Maven downloads.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ BUILD_TOOLS_VERSION="${BUILD_TOOLS_VERSION:-36.1.0}"
 NDK_VERSION="${NDK_VERSION:-27.3.13750724}"
 API="${API_LEVEL:-26}"
 TARGET_API=34
-ABIS=("arm64-v8a" "x86_64")
+ABIS=(arm64-v8a x86_64)
 
 BT="$SDK/build-tools/$BUILD_TOOLS_VERSION"
 PLATFORM="$SDK/platforms/android-$TARGET_API/android.jar"
@@ -38,72 +38,73 @@ KEY_PASS="walletee"
 KEY_ALIAS="walle"
 
 OUT="$PROJECT/build/apk"
-APK="$PROJECT/build/Wall-E-console.apk"
+APK="$PROJECT/build/Wall-E-engine.apk"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[[ -x "$BT/aapt2.exe" || -f "$BT/aapt2.exe" ]] || die "aapt2 not found in $BT"
+[[ -f "$BT/aapt2.exe" ]] || die "aapt2 not found in $BT"
 [[ -f "$PLATFORM" ]] || die "android.jar not found at $PLATFORM"
 [[ -d "$NDK" ]] || die "NDK not found at $NDK"
-[[ -x "$JAVAC" || -f "$JAVAC" ]] || die "javac not found at $JAVAC"
-[[ -f "$PROJECT/chess.cpp" && -f "$PROJECT/nnue.cpp" ]] || die "engine sources missing"
+[[ -f "$JAVAC" ]] || die "javac not found at $JAVAC"
+[[ -f "$PROJECT/chess.cpp" && -f "$PROJECT/nnue.cpp" && -f "$PROJECT/nnue_embedded.cpp" ]] \
+    || die "engine sources missing"
+[[ -f "$PROJECT/nnue/fingolfin.nnue" ]] || die "network nnue/fingolfin.nnue missing"
+
+clang_for() {
+    local triple="$1"
+    local cxx="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/${triple}${API}-clang++.cmd"
+    [[ -f "$cxx" ]] || cxx="${cxx%.cmd}"
+    [[ -f "$cxx" ]] || die "NDK clang++ for $triple (API $API) not found"
+    printf '%s' "$cxx"
+}
 
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage" "$PROJECT/build"
 
-echo "== 1/7 native engine (API $API: ${ABIS[*]})"
-for ABI in "${ABIS[@]}"; do
-    case "$ABI" in
-        arm64-v8a) TARGET="aarch64-linux-android${API}" ;;
-        x86_64)    TARGET="x86_64-linux-android${API}" ;;
-        *) die "unsupported ABI $ABI" ;;
+echo "== 1/6 native engine (embedded NNUE, PIE, max-page-size 16 KiB)"
+# Compiled from the project root: nnue_embedded.cpp uses .incbin "nnue/fingolfin.nnue",
+# which the assembler resolves against the compiler's working directory.
+for abi in "${ABIS[@]}"; do
+    case "$abi" in
+        arm64-v8a) triple="aarch64-linux-android" ;;
+        x86_64)    triple="x86_64-linux-android" ;;
+        *) die "unsupported ABI $abi" ;;
     esac
-    CXX="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/${TARGET}-clang++.cmd"
-    [[ -f "$CXX" ]] || CXX="${CXX%.cmd}"
-    [[ -f "$CXX" ]] || die "NDK clang++ for $TARGET not found"
-    echo "   $ABI"
-    mkdir -p "$OUT/lib/$ABI"
-    "$CXX" -O3 -std=c++20 -DNDEBUG -fPIE -pie -static-libstdc++ \
-           -Wl,--gc-sections -s \
-           -o "$OUT/lib/$ABI/libengine.so" \
-           "$PROJECT/chess.cpp" "$PROJECT/nnue.cpp"
+    CXX="$(clang_for "$triple")"
+    echo "   $abi"
+    mkdir -p "$OUT/stage/lib/$abi"
+    ( cd "$PROJECT" && "$CXX" -O3 -std=c++20 -DNDEBUG -DWALLE_EMBEDDED_NET \
+            -fPIE -pie -static-libstdc++ \
+            -Wl,--gc-sections -Wl,-z,max-page-size=16384 -s \
+            -o "$OUT/stage/lib/$abi/libwalle.so" \
+            chess.cpp nnue.cpp nnue_embedded.cpp )
 done
 
-echo "== 2/7 java sources"
-# Quoted globs (not $(find ...)) so the space in this folder's name survives.
+echo "== 2/6 java sources (provider only, no UI)"
 "$JAVAC" -source 8 -target 8 -Xlint:-options -classpath "$PLATFORM" \
          -d "$OUT/classes" "$HERE/java/com/tianl1234/walle"/*.java
 
-echo "== 3/7 dex"
+echo "== 3/6 dex"
 "$BT/d8.bat" --min-api "$API" --lib "$PLATFORM" \
     --output "$OUT/dex" "$OUT/classes/com/tianl1234/walle"/*.class
+cp "$OUT/dex/classes.dex" "$OUT/stage/"
 
-echo "== 4/7 resources"
+echo "== 4/6 resources (res/xml/enginelist.xml)"
 "$BT/aapt2.exe" compile --dir "$HERE/res" -o "$OUT/res.zip"
 
-echo "== 5/7 stage assets (NNUE network)"
-# Assets and native libs are added with jar rather than aapt2 -A/zip: this shell
-# has no zip, and aapt2 on Windows writes asset entries with a backslash
-# separator, which AssetManager cannot open as "nnue/fingolfin.nnue".
-mkdir -p "$OUT/stage/assets/nnue" "$OUT/stage/lib"
-cp "$PROJECT/nnue/fingolfin.nnue" "$OUT/stage/assets/nnue/fingolfin.nnue"
-cp "$OUT/dex/classes.dex" "$OUT/stage/"
-for ABI in "${ABIS[@]}"; do
-    mkdir -p "$OUT/stage/lib/$ABI"
-    cp "$OUT/lib/$ABI/libengine.so" "$OUT/stage/lib/$ABI/"
-done
-
-echo "== 6/7 package + link"
+echo "== 5/6 package + link"
 "$BT/aapt2.exe" link -o "$OUT/base.apk" -I "$PLATFORM" \
     --manifest "$HERE/AndroidManifest.xml" \
     --min-sdk-version "$API" --target-sdk-version "$TARGET_API" \
     "$OUT/res.zip"
 
-(cd "$OUT/stage" && "$JAR" uf "$OUT/base.apk" classes.dex assets lib)
+# jar (not zip) because this shell has none; it also keeps forward slashes in the
+# lib/ entries, which native library extraction requires.
+( cd "$OUT/stage" && "$JAR" uf "$OUT/base.apk" classes.dex lib )
 
 "$BT/zipalign.exe" -f -p 4 "$OUT/base.apk" "$OUT/aligned.apk"
 
-echo "== 7/7 sign"
+echo "== 6/6 sign"
 KS="$HERE/keystore/wall-e.jks"
 if [[ ! -f "$KS" ]]; then
     mkdir -p "$HERE/keystore"
@@ -122,6 +123,13 @@ fi
 echo
 echo "== verify"
 "$BT/aapt2.exe" dump badging "$APK" | grep -E "^(package|sdkVersion|targetSdkVersion|application-label|native-code)" || true
+
+# Enforce the whole point of this package: no launcher entry, so no icon and no UI.
+if "$BT/aapt2.exe" dump xmltree --file AndroidManifest.xml "$APK" | grep -q 'android.intent.category.LAUNCHER'; then
+    die "APK declares a LAUNCHER category - it would show an icon"
+fi
+echo "   no launcher category (no icon, no UI): ok"
+
 "$BT/apksigner.bat" verify --print-certs "$APK" | grep -E "^(Verifies|Signer #1 certificate DN)" || true
 
 echo

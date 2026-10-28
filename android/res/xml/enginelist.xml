@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    OEX engine list. A chess GUI resolves this resource through
+    Resources.getIdentifier("enginelist", "xml", packageName) and instantiates every
+    <engine> whose "target" contains the device's Build.CPU_ABI, using
+    nativeLibraryDir + "/" + filename as the executable path.
+-->
+<enginelist>
+    <engine
+        name="Wall-E 1.2"
+        filename="libwalle.so"
+        target="arm64-v8a|x86_64" />
+</enginelist>

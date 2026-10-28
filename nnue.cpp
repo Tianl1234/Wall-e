@@ -30,12 +30,19 @@ struct alignas(64) Network {
 };
 std::unique_ptr<Network> network;
 
-bool load_network(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return false;
+// Only the Android package defines WALLE_EMBEDDED_NET. The network is appended to
+// the engine binary there (see nnue_embedded.cpp) because a GUI executes the engine
+// out of the APK's lib directory, where there is no working directory to hold
+// nnue/fingolfin.nnue.
+#if defined(WALLE_EMBEDDED_NET)
+extern "C" const unsigned char walle_nnue_start[];
+extern "C" const unsigned char walle_nnue_end[];
+#endif
+
+bool load_network_memory(const void* data, std::size_t size) {
+    if (data == nullptr || size < NETWORK_BYTES) return false;
     std::vector<int16_t> raw(NETWORK_BYTES / sizeof(int16_t));
-    file.read(reinterpret_cast<char*>(raw.data()), NETWORK_BYTES);
-    if (file.gcount() != static_cast<std::streamsize>(NETWORK_BYTES)) return false;
+    std::memcpy(raw.data(), data, NETWORK_BYTES);
 
     auto candidate = std::make_unique<Network>();
     std::size_t offset = 0;
@@ -49,6 +56,15 @@ bool load_network(const std::string& path) {
     candidate->outputBias = raw[offset];
     network = std::move(candidate);
     return true;
+}
+
+bool load_network(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    std::vector<int16_t> raw(NETWORK_BYTES / sizeof(int16_t));
+    file.read(reinterpret_cast<char*>(raw.data()), NETWORK_BYTES);
+    if (file.gcount() != static_cast<std::streamsize>(NETWORK_BYTES)) return false;
+    return load_network_memory(raw.data(), NETWORK_BYTES);
 }
 
 inline int feature_index(int piece, int square, int perspective) {
@@ -162,6 +178,16 @@ int infer(const Accumulator& acc, int stm) {
 } // namespace
 
 bool load(const std::string& networkPath) { return load_network(networkPath); }
+
+bool load_embedded() {
+#if defined(WALLE_EMBEDDED_NET)
+    const std::size_t size = static_cast<std::size_t>(walle_nnue_end - walle_nnue_start);
+    return load_network_memory(walle_nnue_start, size);
+#else
+    return false;
+#endif
+}
+
 bool available() { return static_cast<bool>(network); }
 
 void apply_changes(Accumulator& acc, const PieceChange* changes, int count) {

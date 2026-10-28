@@ -13,6 +13,8 @@ struct alignas(64) Accumulator {
 };
 
 bool load(const std::string& networkPath);
+// Network linked into the binary instead of read from disk (Android package).
+bool load_embedded();
 bool available();
 struct PieceChange { int color; int type; int square; bool add; };
 void apply_changes(Accumulator& accumulator, const PieceChange* changes, int count);

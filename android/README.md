@@ -1,117 +1,132 @@
-# Wall-E — Android console
+# Wall-E — Android engine package (no UI)
 
-An installable APK (version 1.1) that runs the Wall-E chess engine on Android, with the
-NNUE network embedded inside the APK. It is a **console**, not a board GUI: it runs the
-engine, streams every UCI line it prints, and offers presets for the engine's own test
-commands (bench, perft, analysis).
+An installable APK that contains the Wall-E chess engine and **nothing else**. There is
+no screen, no chessboard, no console, and no launcher icon — it is a headless UCI engine
+packaged the same way as every other Android engine (Stockfish, Patricia, Ethereal,
+Crafty, …), so a chess GUI can find and use it.
 
-The APK is **universal**: `arm64-v8a` for phones and `x86_64` for emulators and
-Chromebooks. An APK that ships only one ABI installs on other devices but never extracts
-an engine, which is exactly the "engine binary missing" failure this build fixes; the
-app now also prints the device ABIs and the contents of `nativeLibraryDir` at startup.
+That "invisible after install" behaviour is the point: the package has no
+`android.intent.category.LAUNCHER` entry. There is nothing to open; the engine shows up
+inside a GUI's engine list instead.
 
-## What is in the APK
+## Why this format
 
-| Part | Contents |
-|---|---|
-| Engine | `lib/arm64-v8a/libengine.so` and `lib/x86_64/libengine.so` — the same C++ engine per ABI |
-| Network | `assets/nnue/fingolfin.nnue` (extracted to app storage on first launch) |
-| UI | One activity: transcript, FEN field, command field, presets |
+Android 10+ forbids executing binaries from app-writable storage (W^X), so the old
+"copy an ARM binary to the SD card and import it" route no longer works. The workaround
+every Android engine uses is to ship the engine as a **native library** inside an APK:
 
-The engine is shipped as `libengine.so` on purpose. Android extracts native libraries into
-an executable directory, while files written to the app's private data directory cannot be
-executed at all on Android 10+ (W^X). Copying the binary from assets and `chmod +x`-ing it
-would therefore fail with `EACCES` on any modern phone. `android:extractNativeLibs="true"`
-in the manifest is what guarantees the extraction happens.
-
-## Porting notes
-
-The engine was x86-only. Three things had to change for AArch64:
-
-1. **Slider attacks.** `_pext_u64` / `_pdep_u64` are BMI2 instructions. The portable backend
-   uses magic bitboards with multipliers generated offline (see `build/gen_magics.cpp`) and
-   embedded as constants — searching for them at runtime needs hundreds of thousands of
-   attempts on the hardest squares, which is far too slow at app start. A collision check
-   turns a bad constant into a loud startup failure instead of silently wrong moves.
-   On x86 the PEXT backend is still used, and `-DWALLE_NO_PEXT` forces the portable path so
-   it can be tested on a desktop.
-2. **NNUE.** The x86 intrinsics are guarded, and `nnue.cpp` gained NEON paths for the three
-   hot operations: saturating accumulator adds (`vqaddq_s16`), batched delta application
-   (widening `vmull`/`vaddq_s32` + saturating `vqmovn_s32`) and output-layer inference
-   (`vminq`/`vmaxq` clamp, wrapping `vmulq_s16`, `vmlal_s16` accumulation). The arithmetic
-   mirrors the x86 path exactly — same wrapping int16 products, same 32-bit accumulation,
-   same rounding.
-3. **PIE.** Android requires position-independent executables; the NDK build uses `-fPIE -pie`.
-
-Everything else (search, TT, Lazy SMP, UCI loop, `perft`/`verify`/`bench`) is untouched.
-
-## Build
-
-Requirements:
-
-- JDK 17+ (the script uses `JAVA_HOME_NIX`, defaulting to the local JDK 21)
-- Android SDK with `platforms;android-34`, `build-tools;36.1.0`, `ndk;27.3.13750724`
-- No Gradle, no Android Studio, no Maven downloads
-
-```sh
-cd "android"
-bash build_apk.sh
+```
+lib/arm64-v8a/libwalle.so
+lib/x86_64/libwalle.so
 ```
 
-Output: `build/Wall-E-console.apk`, signed with a generated development key
-(`android/keystore/wall-e.jks`, password `walletee`, alias `walle`). That key is fine for
-sideloading; a Play Store upload would need your own keystore.
+`android:extractNativeLibs="true"` makes Android's package manager extract those files
+into the app's `nativeLibraryDir`, which is executable and not app-writable, so GUIs are
+allowed to run them. The `.so` name is a packaging requirement; the file itself is a
+normal PIE executable with a `main()` that speaks UCI on stdin/stdout.
 
-Toolchain paths can be overridden with `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`,
-`BUILD_TOOLS_VERSION`, `NDK_VERSION`, `API_LEVEL` and `JAVA_HOME_NIX`.
+## Discovery protocol (Open Exchange / OEX)
 
-### Two build gotchas worth knowing
+The package implements the convention that Android chess GUIs use. Everything below was
+copied from working engine APKs rather than invented:
 
-- **build-tools 34.0.0 cannot dex this app.** Its D8 (R8 8.2.2) crashes with an internal
-  `NullPointerException` on every anonymous inner class that a modern javac emits, so the
-  script defaults to 36.1.0. This is a toolchain bug, not a source problem.
-- **Assets and the native library are added with `jar`, not `zip`/`aapt2 -A`.** Git Bash has
-  no `zip`, and aapt2 on Windows stores asset entries with a backslash
-  (`assets/nnue\fingolfin.nnue`), which `AssetManager.open("nnue/fingolfin.nnue")` cannot
-  resolve. Staging them and updating the APK with the JDK's `jar` keeps forward slashes.
+| Piece | Value |
+|---|---|
+| Marker action | `intent.chess.provider.ENGINE` on an exported activity |
+| Provider authority | `chess.provider.engine.authority` meta-data on that activity |
+| Engine list resource | `res/xml/enginelist.xml`, found via `getIdentifier("enginelist", "xml", pkg)` |
+| Executable | `ApplicationInfo.nativeLibraryDir + "/" + filename` |
+| Provider MIME type | `application/x-chess-engine` |
 
-## Install
+`res/xml/enginelist.xml`:
 
-Copy the APK to the phone (USB, Drive, anything), tap it, and allow installing from that
-source when Android asks. It needs no permissions, no network and no Google services.
-If the engine is reported missing, the transcript now shows the device ABIs and the
-`nativeLibraryDir` contents, which identifies an ABI mismatch immediately.
+```xml
+<enginelist>
+    <engine name="Wall-E 1.2" filename="libwalle.so" target="arm64-v8a|x86_64" />
+</enginelist>
+```
+
+A GUI queries activities with the marker action, reads the authority, opens that
+package's `enginelist`, picks the `<engine>` whose `target` contains the device ABI and
+executes the file in `nativeLibraryDir`. `EngineProvider` additionally serves the binary
+over `content://com.tianl1234.walle.EngineProvider/libwalle.so` for GUIs that copy the
+engine through a content resolver instead of executing it in place.
+
+## The network is inside the binary
+
+There is no `nnue/fingolfin.nnue` file in the APK. The GUI runs the engine from a
+directory it does not control, so a relative path can never be trusted. Instead
+`nnue_embedded.cpp` appends the 1,579,010-byte network to the executable with
+`.incbin`, and `Nnue::load_embedded()` reads it from there. A GUI log will show:
+
+```
+info string NNUE loaded: <embedded network>
+```
+
+If instead it says `NNUE unavailable`, the network was not linked — the engine still
+plays, but with the weaker handcrafted evaluation.
 
 ## Using it
 
-- On launch the network is extracted, the engine starts, and the transcript shows
-  `info string NNUE loaded: /data/user/0/com.tianl1234.walle/files/nnue/fingolfin.nnue`.
-  That line is the proof the network is active; if it says `NNUE unavailable`, the app is
-  running on the handcrafted fallback evaluation.
-- **Bench** runs `bench 12` (six standard positions) and prints nodes/time/NPS.
-- **Perft 5** sets the position from the FEN field (empty = startpos) and runs perft.
-- **Analyze** sets the position and runs `go depth 16`, streaming the PV.
-- **Stop**, **Restart** and **Clear** do the obvious things.
-- The command field accepts any UCI command, e.g. `setoption name Threads value 4`,
-  `go movetime 5000`, `eval`, `verify 3`.
+1. Install `Wall-E-engine.apk` (it will not appear in the launcher — by design).
+2. In a GUI that supports OEX engines (Chess for Android, Chessis, and other
+   kalab-based GUIs), open the engine menu and **import/select an engine**.
+3. Pick **Wall-E 1.2** from the list.
+
+For Chess for Android specifically: long-press the notation window → *UCI and XBoard* →
+*Import engine* → *Wall-E 1.2*. No SD-card import step is needed.
+
+The APK upgrades the previous console build in place (`versionCode 3`, same signing
+key), so the old icon disappears when you install it.
+
+## Build
+
+Requirements: JDK 17+, Android SDK with `platforms;android-34`,
+`build-tools;36.1.0` (D8 in 34.0.0 crashes on modern javac output) and
+`ndk;27.3.13750724`. No Gradle, no Android Studio.
+
+```sh
+cd android
+bash build_apk.sh
+# -> ../build/Wall-E-engine.apk  (arm64-v8a + x86_64)
+```
+
+Toolchain paths can be overridden with `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`,
+`BUILD_TOOLS_VERSION`, `NDK_VERSION`, `API_LEVEL` and `JAVA_HOME_NIX`. The script fails
+the build if a `LAUNCHER` category ever appears in the manifest, so an accidental icon
+cannot ship.
+
+### Build gotchas worth knowing
+
+- **build-tools 34.0.0 cannot dex this app.** Its D8 (R8 8.2.2) crashes with an internal
+  `NullPointerException` on anonymous inner classes emitted by a modern javac, so the
+  script defaults to 36.1.0. Toolchain bug, not a source problem.
+- **Assets and native libraries are added with `jar`, not `zip`.** Git Bash has no
+  `zip`, and aapt2 on Windows writes asset entries with backslashes, which
+  `AssetManager` cannot resolve.
+- **The engine is compiled from the project root.** `nnue_embedded.cpp` uses
+  `.incbin "nnue/fingolfin.nnue"`, whose path is resolved against the compiler's
+  working directory.
+- **`-Wl,-z,max-page-size=16384`** keeps the executable loadable on 16 KB-page devices
+  (Android 15+ on some ARM64 hardware).
 
 ## Verification status
 
-Checked on this machine:
+Checked on this machine (`build/Wall-E-engine.apk`, 2,253,409 bytes,
+SHA-256 `ed280b7649fbf344b805280ecbaa0477a04f09aeb302d628d1ab95264fdeb098`):
 
 | Check | Result |
 |---|---|
-| Portable slider backend (x86, `-DWALLE_NO_PEXT`) | six standard perft positions pass; `bench 12` = 912,862 nodes, identical to the PEXT build |
-| NNUE | `NNUE loaded` on both builds; `eval` returns a value |
-| Native engine ELF | arm64: AArch64 PIE, entry `0x2A7F0`; x86_64: PIE, entry `0x29730`; no TEXTREL, only `libc`/`libm`/`libdl` needed |
-| APK manifest | `com.tianl1234.walle`, versionCode 2 / versionName 1.1, `minSdkVersion 26`, `targetSdkVersion 34`, `extractNativeLibs=true` |
-| APK ABIs | `native-code: 'arm64-v8a' 'x86_64'` |
-| APK contents | `classes.dex` 17,840 B; `assets/nnue/fingolfin.nnue` 1,579,010 B; `lib/arm64-v8a/libengine.so` 559,816 B; `lib/x86_64/libengine.so` 548,600 B |
-| Signature | `apksigner verify`: exit 0, v2 and v3 schemes true |
-| APK size / SHA-256 | 1,340,083 B / `86c235e98c85322e67e05f668b0a9643e1df755835e3673d652ce01edb4623ce` |
+| Launcher entry | none — `aapt2 dump badging` shows no `launchable-activity`, `application: icon=''`; build script enforces it |
+| Manifest | `com.tianl1234.walle`, versionCode 3 / versionName 1.2, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| OEX wiring | `intent.chess.provider.ENGINE`, `chess.provider.engine.authority`, exported `EngineProvider`, `res/xml/enginelist.xml` present as `xml/enginelist` |
+| Native code | `arm64-v8a`, `x86_64`; both ELF64 `ET_DYN` PIE with entry points, LOAD `Align 0x4000`, only `libc`/`libm`/`libdl` needed, no TEXTREL |
+| Embedded network | network's first 64 bytes found inside both binaries (offsets 73,664 / 71,488); each is 1.58 MB larger than the pre-embedding engine |
+| Signature | `apksigner verify`: v2 and v3 true, `CN=Wall-E` |
+| Loader refactor (host x86-64) | `NNUE loaded: nnue/fingolfin.nnue`, `perft 5` = **4,865,609**, `bench 12` = 912,862 nodes |
+| APK contents | `classes.dex` 3,612 B; `res/xml/enginelist.xml` 352 B; two `libwalle.so`; nothing else except signatures |
 
-Not checked: the app was never launched. This machine has no ARM CPU, no emulator and no
-`adb`, so the NEON kernels are compile-verified only. If they were wrong the engine would
-misplay rather than crash, which is why one **Perft 5** tap on the phone is the first thing
-to do — the transcript prints the node count, so a wrong slider backend or accumulator shows
-up immediately.
+**Not checked:** the package was never installed or run on an Android device (no ARM
+hardware, no emulator, no adb here). The NEON NNUE kernels and the extraction/exec path
+are therefore compile- and structure-verified only. The first real test is `perft 5`
+from the GUI — it must return 4,865,609.

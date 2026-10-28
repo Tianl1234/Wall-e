@@ -1975,6 +1975,14 @@ int main(int argc, char** argv) {
         evalFile = (exeDir / "nnue" / "fingolfin.nnue").string();
         loaded = Nnue::load(evalFile);
     }
+#if defined(WALLE_EMBEDDED_NET)
+    // Android package: the network is part of the binary, since a GUI runs the engine
+    // from the APK's lib directory where no nnue/ folder exists.
+    if (!loaded) {
+        loaded = Nnue::load_embedded();
+        if (loaded) evalFile = "<embedded network>";
+    }
+#endif
     if (loaded) std::cerr << "info string NNUE loaded: " << evalFile << '\n';
     else std::cerr << "info string NNUE unavailable; using handcrafted evaluation\n";
 
