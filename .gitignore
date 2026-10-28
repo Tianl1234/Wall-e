@@ -1,3 +1,7 @@
 chess.exe
 build/
 *.o
+
+# Android build output and the local development signing key
+android/keystore/
+*.keystore

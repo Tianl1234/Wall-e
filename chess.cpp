@@ -27,9 +27,20 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 #include <filesystem>
 #include "nnue.h"
+
+// PEXT/PDEP exist only on x86 with BMI2. Every other target (notably AArch64)
+// uses the portable magic-bitboard backend below. -DWALLE_NO_PEXT forces the
+// portable path on x86 as well, which is how it gets tested on the desktop.
+#if defined(__BMI2__) && (defined(__x86_64__) || defined(__i386__)) && !defined(WALLE_NO_PEXT)
+#define WALLE_PEXT 1
+#else
+#define WALLE_PEXT 0
+#endif
 
 using U64 = uint64_t;
 using Clock = std::chrono::steady_clock;
@@ -84,6 +95,9 @@ U64 KnightAtt[64], KingAtt[64];
 U64 RookMask[64], BishopMask[64];
 U64 RookTable[64][4096];
 U64 BishopTable[64][512];
+#if !WALLE_PEXT
+int RookShift[64], BishopShift[64];
+#endif
 U64 CastleMask[64];
 
 constexpr U64 FILE_A_BB = 0x0101010101010101ULL;
@@ -274,6 +288,79 @@ static U64 next_rand() {
     return z ^ (z >> 31);
 }
 
+#if !WALLE_PEXT
+// Scatter the low bits of idx into the set bits of mask: the inverse of PEXT.
+static U64 scatter_bits(int idx, U64 mask) {
+    U64 occ = 0;
+    while (mask) {
+        const int b = lsb(mask);
+        mask &= mask - 1;
+        if (idx & 1) occ |= bit(b);
+        idx >>= 1;
+    }
+    return occ;
+}
+
+// Magic multipliers generated offline with this exact mask convention
+// (shift = 64 - popcount(mask)) by build/gen_magics.cpp. Embedding them keeps
+// startup instant: searching for them at runtime needs hundreds of thousands
+// of attempts on the hardest squares, which is far too slow on a phone.
+static const U64 ROOK_MAGICS[64] = {
+    0x948001A084400011ULL, 0x0040100040002002ULL, 0x0080200080100008ULL, 0x1100042100081001ULL,
+    0x0200100200080420ULL, 0x0B00040032281100ULL, 0x8480090000801600ULL, 0x0600008044110022ULL,
+    0xC803800040026380ULL, 0x50C0402000401002ULL, 0x8080801000802000ULL, 0x8402001042000820ULL,
+    0x5400800800800400ULL, 0x5022000200100804ULL, 0x000C000190420804ULL, 0x8830800100004080ULL,
+    0x4000908000400020ULL, 0x0810004040002009ULL, 0x8830002004080021ULL, 0x4048090021001000ULL,
+    0x0898008008800400ULL, 0x0200808002000400ULL, 0x0010040002010810ULL, 0x00000200011040A4ULL,
+    0x0380004040002000ULL, 0x4000200080804000ULL, 0x0900200080100080ULL, 0x0000100080080080ULL,
+    0x8100040080800800ULL, 0x0100040080020080ULL, 0x8000020400011088ULL, 0x8042488600050044ULL,
+    0x2081C00284800020ULL, 0x0030102000404000ULL, 0x0120010041002018ULL, 0x0500800800801004ULL,
+    0x5020040080800800ULL, 0x0000800200800400ULL, 0x8411100884000241ULL, 0x0008004102000084ULL,
+    0x2000204000908000ULL, 0x0020200050004000ULL, 0x0100200010008080ULL, 0x0094100009010020ULL,
+    0x4808000402004040ULL, 0x2881002400090022ULL, 0x4200020004010100ULL, 0x0000408044020001ULL,
+    0x0B18402900800100ULL, 0x1040830240002300ULL, 0x0020200010008080ULL, 0x0002100021000900ULL,
+    0x0300800400080080ULL, 0x0006000410080200ULL, 0x0401000200040100ULL, 0x0A04010040840200ULL,
+    0x2008902140800301ULL, 0x0044810018244001ULL, 0x2001002000084011ULL, 0x2042208910005501ULL,
+    0x00020020481004AAULL, 0x0201000816040047ULL, 0x001000C102100804ULL, 0x0582105100208402ULL,
+};
+
+static const U64 BISHOP_MAGICS[64] = {
+    0x4090300090841040ULL, 0x0060240400982100ULL, 0x0804214202040800ULL, 0x1804410020150C01ULL,
+    0x0804504109822042ULL, 0x00008211408500A0ULL, 0x8402022202420082ULL, 0x0204240202108208ULL,
+    0x00080909100C0840ULL, 0x000012101E022040ULL, 0x080604880A004000ULL, 0x3600844100200200ULL,
+    0x0024020210883840ULL, 0x0200020184200000ULL, 0x00001C22080404C0ULL, 0x8080060209110811ULL,
+    0x0420000461020210ULL, 0x0420900401120220ULL, 0x0004000808202202ULL, 0x0010410808102022ULL,
+    0x8604010210220200ULL, 0x0004089210040402ULL, 0x2840800404444204ULL, 0x0400422084240100ULL,
+    0x0820902005042804ULL, 0x0008840648010820ULL, 0x0880481010002040ULL, 0x0311080004040410ULL,
+    0x1501010118104000ULL, 0x43100410A0820080ULL, 0x0000820901211024ULL, 0x0404010334210148ULL,
+    0x01010410C3421000ULL, 0xA302701000040107ULL, 0x0382010113100050ULL, 0x8100080800060A00ULL,
+    0x0080420020020080ULL, 0xA082080108621000ULL, 0x2110810100005400ULL, 0x2000810208004203ULL,
+    0x01084222A0001001ULL, 0x8000840420048260ULL, 0x00008A0802001401ULL, 0x8100810280802802ULL,
+    0x006002020C000200ULL, 0x100401040101480AULL, 0xA084040800404231ULL, 0x0010211048920100ULL,
+    0x0041041044841000ULL, 0x4302005242300000ULL, 0x0504002884103000ULL, 0x4040521042020808ULL,
+    0x02082072A0220805ULL, 0x1090083010023000ULL, 0x11101012B8104000ULL, 0x02A0260202670802ULL,
+    0xA010404800882000ULL, 0x0200009414010402ULL, 0x0004004202010448ULL, 0x0A00005000420210ULL,
+    0x4000002C48830400ULL, 0x000284882088108AULL, 0x0802400902208200ULL, 0x0068022088021084ULL,
+};
+
+// Fill one square's attack table. The collision check turns a wrong constant
+// into an immediate, loud failure instead of silently wrong moves.
+static void fill_magic_table(int sq, U64 mask, U64 magic, int shift,
+                             const int dirs[4][2], U64* table) {
+    const int size = 1 << popcount(mask);
+    for (int i = 0; i < size; ++i) {
+        const U64 occ = scatter_bits(i, mask);
+        const U64 att = slide_attacks(sq, occ, dirs);
+        U64& slot = table[(occ * magic) >> shift];
+        if (slot && slot != att) {
+            std::cerr << "fatal: magic collision for square " << sq << '\n';
+            std::exit(1);
+        }
+        slot = att;
+    }
+}
+#endif
+
 void init_all() {
     for (int s = 0; s < 64; ++s) {
         int r = rank_of(s), f = file_of(s);
@@ -312,12 +399,19 @@ void init_all() {
     for (int s = 0; s < 64; ++s) {
         RookMask[s]   = pext_mask(s, rook_dirs);
         BishopMask[s] = pext_mask(s, bishop_dirs);
+#if WALLE_PEXT
         int rn = 1 << popcount(RookMask[s]);
         for (int i = 0; i < rn; ++i)
             RookTable[s][i] = slide_attacks(s, _pdep_u64((U64)i, RookMask[s]), rook_dirs);
         int bn = 1 << popcount(BishopMask[s]);
         for (int i = 0; i < bn; ++i)
             BishopTable[s][i] = slide_attacks(s, _pdep_u64((U64)i, BishopMask[s]), bishop_dirs);
+#else
+        RookShift[s]   = 64 - popcount(RookMask[s]);
+        BishopShift[s] = 64 - popcount(BishopMask[s]);
+        fill_magic_table(s, RookMask[s], ROOK_MAGICS[s], RookShift[s], rook_dirs, RookTable[s]);
+        fill_magic_table(s, BishopMask[s], BISHOP_MAGICS[s], BishopShift[s], bishop_dirs, BishopTable[s]);
+#endif
     }
 
     for (int c = 0; c < 2; ++c)
@@ -379,8 +473,13 @@ void init_all() {
             LMRTable[d][m] = (int)(0.77 + std::log((double)d) * std::log((double)m) / 2.36);
 }
 
+#if WALLE_PEXT
 inline U64 rook_att(int s, U64 occ)   { return RookTable[s][_pext_u64(occ, RookMask[s])]; }
 inline U64 bishop_att(int s, U64 occ) { return BishopTable[s][_pext_u64(occ, BishopMask[s])]; }
+#else
+inline U64 rook_att(int s, U64 occ)   { return RookTable[s][((occ & RookMask[s]) * ROOK_MAGICS[s]) >> RookShift[s]]; }
+inline U64 bishop_att(int s, U64 occ) { return BishopTable[s][((occ & BishopMask[s]) * BISHOP_MAGICS[s]) >> BishopShift[s]]; }
+#endif
 
 // ---------------------------------------------------------------------------
 //  Position

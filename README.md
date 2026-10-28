@@ -1,110 +1,98 @@
-# Wall-E
+# Wall-E — APK version
 
-A compact, fast UCI chess engine in C++20: bitboards with PEXT sliders, a full modern search
-stack, Lazy SMP and **incremental NNUE** evaluation. It builds to one statically linked
-`chess.exe` with no runtime dependencies.
+This branch is the **Android version** of the Wall-E chess engine: the same C++20 engine,
+ported to AArch64 and packaged as an installable APK with the NNUE network embedded.
 
-**Download:** [Wall-E version 1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.0.0) —
-`chess.exe` plus the NNUE network `fingolfin.nnue`. The engine reports itself as `Wall-E 2`
-over UCI; this is the first public release.
+**Download:** [Wall-E APK version 1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.0.0-android) —
+`Wall-E-console-arm64.apk` (or use the copy in [`apk/`](apk/)).
 
 ```
-Wall-e/
-  chess.exe            <- release binary (Windows x64, static)
-  nnue/
-    fingolfin.nnue     <- evaluation network (required for full strength)
+Wall-E-console-arm64.apk   1.1 MB, signed, arm64-v8a, Android 8.0+
 ```
 
-The engine looks for `nnue/fingolfin.nnue` in the working directory first, then next to the
-executable, so both layouts work. Without the network it falls back to a handcrafted
-evaluation — it still plays, but noticeably weaker.
+Copy it to an arm64 phone, tap it, and allow installing from that source. It needs no
+permissions, no network and no Google services.
 
-## How strong is it?
+## What it is
 
-There is **no official rating yet**: Wall-E has not played a rated match, so any Elo number is
-an estimate, not a measurement. What was actually measured on the build machine
-(Ryzen 9 9900X, single thread, shipped binary, `bench 12`):
+A **UCI console**, not a board GUI: it starts the engine, streams every line the engine
+prints, and offers presets for the engine's own commands.
 
-| Test | Result |
-|---|---|
-| bench — 6 standard positions, depth 12 | 912,862 nodes in 762 ms (**1.20 Mnps**) |
-| startpos → depth 14 | 143 ms, 264,895 nodes (**1.85 Mnps**) |
-| perft(6) from startpos | 119,060,324 nodes in 1.97 s (**~60 Mnps**) |
-| six standard perft positions | all match (startpos, Kiwipete, positions 3–6) |
-| incremental state self-test (`verify`) | zero Zobrist / material / PSQT / NNUE mismatches |
+- **Bench** — `bench 12`, six standard positions, prints nodes/time/NPS
+- **Perft 5** — move-generation self-test from the FEN field (empty = startpos)
+- **Analyze** — `go depth 16` from the FEN field, streaming the PV
+- **Stop / Restart / Clear**, a FEN field and a free-text UCI command box
+  (`setoption name Threads value 4`, `go movetime 5000`, `eval`, `verify 3`, …)
 
-With NNUE evaluation on top of the search stack described below, the engine is estimated to
-play in the **~2400 Elo class at blitz** on modern single-threaded hardware. That is an
-inference from the architecture and search depth, not a result of games against rated
-opponents; a controlled match against a rated engine is the next step before quoting a number.
+On launch it extracts the network to app storage and prints the engine's own
+`info string NNUE loaded: …` line. If that line says `NNUE unavailable`, the engine is
+running on the weaker handcrafted evaluation.
 
-## Search
+## Contents
 
-* principal variation search with aspiration windows, root move re-ordering between iterations
-* transposition table: 4-way 16-byte buckets, aging, mate-score adjustment, depth-preferred
-* pruning/reduction: null move, reverse futility, razoring, ProbCut, internal iterative
-  reduction, late-move reductions adjusted by history, late-move pruning, futility pruning,
-  SEE pruning, check extension, mate-distance pruning
-* move ordering: TT move, winning/equal captures by SEE, promotions, killers, butterfly and
-  continuation history, counter-moves
-* quiescence search with SEE-based capture ordering, played from a 16-bit move encoding with
-  zero allocation on the hot path
-* Lazy SMP across up to 128 threads sharing one hash table
+```
+chess.cpp, nnue.cpp, nnue.h   engine sources, ported to AArch64
+build.sh                      desktop (x86-64) build, unchanged behaviour
+nnue/fingolfin.nnue           evaluation network (MIT, Adam Kulju)
+android/                      app sources, manifest, Gradle-free build script
+apk/Wall-E-console-arm64.apk  the built, signed APK
+```
 
-## Evaluation
+## Android port — what changed
 
-* NNUE: 768 inputs (own/opponent perspective × piece × square), 1024 hidden units, one
-  output neuron with a quadratic activation layer in Patricia's network format
-* int16 accumulators updated **incrementally** on make/unmake, batched per move, saturating
-  in SIMD (AVX-512 → AVX2 → scalar fallback)
-* handcrafted fallback: PeSTO material/PSQT plus mobility, pawn structure (doubled, isolated,
-  backward, supported, passed by rank), rook files and 7th rank, bishop pair, threats,
-  king shelter and attack units, space, tempo — all tapered by game phase
+The desktop engine was x86-only; three things had to change, none of them in the search:
 
-## UCI options
+1. **Portable slider backend.** `_pext_u64`/`_pdep_u64` are BMI2 instructions. On AArch64 the
+   engine uses magic bitboards with multipliers generated offline
+   (`android/…` notes; generator is in the local Android project) and embedded as constants,
+   because a runtime search needs hundreds of thousands of attempts on the hard squares and
+   would stall app startup. A collision check turns a bad constant into a loud failure.
+   x86 keeps PEXT; `-DWALLE_NO_PEXT` forces the portable path for testing.
+2. **NEON NNUE.** Guarded the x86 intrinsics and added NEON kernels for the three hot
+   operations: saturating accumulator add, batched delta apply, and output-layer inference.
+   The arithmetic mirrors the x86 path exactly (wrapping int16 products, 32-bit accumulation,
+   same rounding).
+3. **Packaging.** Android requires PIE executables and blocks executing files in app storage
+   on Android 10+, so the engine ships as `lib/arm64-v8a/libengine.so` with
+   `extractNativeLibs="true"`; `PackageManager` extracts it executable.
 
-| Option | Default | Range |
-|---|---|---|
-| `Hash` | 256 MB | 1–8192 |
-| `Threads` | 1 | 1–128 |
-| `Move Overhead` | 30 ms | 0–5000 |
-| `EvalFile` | `nnue/fingolfin.nnue` | any path; reloads the network at runtime |
+## Build the APK
 
-Standard protocol is supported (`uci`, `isready`, `setoption`, `ucinewgame`, `position
-[startpos|fen] ... moves ...`, `go` with clocks/depth/movetime/infinite/ponder, `stop`,
-`ponderhit`, `quit`). Search runs asynchronously, so `stop` and `isready` are answered during
-a search. Extra console commands for testing: `d` (board + hash), `eval`, `perft N`,
-`verify N` (recomputes all incremental state over a perft tree), `bench [depth]`.
-
-## Build
-
-The release binary is built with the [w64devkit](https://github.com/skeeto/w64devkit) GCC:
+Requires JDK 17+, Android SDK `platforms;android-34`, `build-tools;36.1.0` and
+`ndk;27.3.13750724`. No Gradle.
 
 ```sh
-g++ -O3 -march=znver5 -std=c++20 -DNDEBUG \
-    -static -static-libgcc -static-libstdc++ \
-    -o chess.exe chess.cpp nnue.cpp
+cd android
+bash build_apk.sh
 ```
 
-`build.sh` does exactly this and is the recommended entry point. Static linking is required
-for GUIs: a dynamically linked build needs `libstdc++-6.dll` / `libgcc_s_seh-1.dll`, which are
-not on the system PATH, and the engine then dies at process start (seen as a disconnect in
-En Croissant and Arena).
+Output: `../build/Wall-E-console-arm64.apk`, signed with a generated development key
+(`android/keystore/wall-e.jks`, password `walletee`, alias `walle` — a dev key, not a store
+key). Build-tools 34.0.0 cannot dex this app (its D8 crashes on modern javac's anonymous
+classes); 36.1.0 is required.
 
-`-march=znver5` targets Zen 4/5 (AVX-512, BMI2). On older CPUs rebuild with
-`-march=x86-64-v3` (AVX2, BMI2) or `-march=x86-64` (portable, much slower NNUE path) by
-setting `CXXFLAGS`-equivalent flags in `build.sh`. The PEXT bitboard backend needs BMI2; on
-CPUs without it, replace `_pext_u64` with the magic-bitboard path.
+## Verification
 
-## Using it in a GUI
+| Check | Result |
+|---|---|
+| Portable slider path (x86, `-DWALLE_NO_PEXT`) | all six standard perft positions pass; `bench 12` = 912,862 nodes, identical to PEXT |
+| ARM engine | AArch64, PIE, entry `0x2A7F0`, no TEXTREL, needs only `libc`/`libm`/`libdl` |
+| APK manifest | `com.tianl1234.walle`, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| APK contents | `assets/nnue/fingolfin.nnue` 1,579,010 B; `lib/arm64-v8a/libengine.so` 559,816 B |
+| Signature | `apksigner verify` exit 0, v2 + v3 true |
+| APK SHA-256 | `8ab99b6d080fed48870335b350f30bf0c8f4d9488a9734d629e1097a0107f18f` |
 
-Add `chess.exe` as a UCI engine in En Croissant, Arena, Cute Chess or BanksiaGUI and keep the
-`nnue/` folder beside the executable. Nothing else is needed.
+Not verified: the app has never been launched. There is no ARM device, emulator or `adb` in
+the build environment, so the NEON kernels are compile-verified only. On the phone, tap
+**Perft 5** with an empty FEN field first — startpos perft(5) must be **4,865,609**.
 
-## License and credits
+## Strength
 
-Code: MIT — see [LICENSE](LICENSE).
+Unrated, same as the desktop engine: measured 1.20 Mnps on the six-position bench and depth 14
+from startpos in 143 ms on a Ryzen 9 9900X (single thread). Estimated ~2400 Elo class at
+blitz; no match against rated opposition has been run.
 
-The NNUE network `nnue/fingolfin.nnue` is Patricia's network by Adam Kulju, used under the MIT
-license (see [nnue/PATRICIA-LICENSE.txt](nnue/PATRICIA-LICENSE.txt)). Patricia is not
-included in this repository, only its evaluation network.
+## License
+
+MIT for the engine (see [LICENSE](LICENSE)). The network `nnue/fingolfin.nnue` is Patricia's
+by Adam Kulju, used under MIT — see [nnue/PATRICIA-LICENSE.txt](nnue/PATRICIA-LICENSE.txt).
