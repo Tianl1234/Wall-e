@@ -3,15 +3,20 @@
 This branch is the **Android version** of the Wall-E chess engine: the same C++20 engine,
 ported to AArch64 and packaged as an installable APK with the NNUE network embedded.
 
-**Download:** [Wall-E APK version 1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.0.0-android) —
-`Wall-E-console-arm64.apk` (or use the copy in [`apk/`](apk/)).
+**Download:** [Wall-E APK version 1.1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.0.0-android) —
+`Wall-E-console.apk` (or use the copy in [`apk/`](apk/)).
 
 ```
-Wall-E-console-arm64.apk   1.1 MB, signed, arm64-v8a, Android 8.0+
+Wall-E-console.apk   1.3 MB, signed, arm64-v8a + x86_64, Android 8.0+
 ```
 
-Copy it to an arm64 phone, tap it, and allow installing from that source. It needs no
-permissions, no network and no Google services.
+Copy it to an arm64 phone (or an x86_64 emulator/Chromebook), tap it, and allow
+installing from that source. It needs no permissions, no network and no Google services.
+
+The APK is universal on purpose: an arm64-only build installs on an x86_64 emulator but
+never extracts an engine, which shows up as "engine binary missing". The app now prints
+the device ABIs and the contents of `nativeLibraryDir` at startup, so a mismatch is
+visible instead of silent.
 
 ## What it is
 
@@ -35,7 +40,7 @@ chess.cpp, nnue.cpp, nnue.h   engine sources, ported to AArch64
 build.sh                      desktop (x86-64) build, unchanged behaviour
 nnue/fingolfin.nnue           evaluation network (MIT, Adam Kulju)
 android/                      app sources, manifest, Gradle-free build script
-apk/Wall-E-console-arm64.apk  the built, signed APK
+apk/Wall-E-console.apk        the built, signed APK (versionCode 2, version 1.1)
 ```
 
 ## Android port — what changed
@@ -66,7 +71,7 @@ cd android
 bash build_apk.sh
 ```
 
-Output: `../build/Wall-E-console-arm64.apk`, signed with a generated development key
+Output: `../build/Wall-E-console.apk`, signed with a generated development key
 (`android/keystore/wall-e.jks`, password `walletee`, alias `walle` — a dev key, not a store
 key). Build-tools 34.0.0 cannot dex this app (its D8 crashes on modern javac's anonymous
 classes); 36.1.0 is required.
@@ -77,10 +82,11 @@ classes); 36.1.0 is required.
 |---|---|
 | Portable slider path (x86, `-DWALLE_NO_PEXT`) | all six standard perft positions pass; `bench 12` = 912,862 nodes, identical to PEXT |
 | ARM engine | AArch64, PIE, entry `0x2A7F0`, no TEXTREL, needs only `libc`/`libm`/`libdl` |
-| APK manifest | `com.tianl1234.walle`, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
-| APK contents | `assets/nnue/fingolfin.nnue` 1,579,010 B; `lib/arm64-v8a/libengine.so` 559,816 B |
+| APK manifest | `com.tianl1234.walle`, versionCode 2 / versionName 1.1, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| APK contents | `assets/nnue/fingolfin.nnue` 1,579,010 B; `lib/arm64-v8a/libengine.so` 559,816 B; `lib/x86_64/libengine.so` 548,600 B |
+| APK ABIs | `native-code: 'arm64-v8a' 'x86_64'` |
 | Signature | `apksigner verify` exit 0, v2 + v3 true |
-| APK SHA-256 | `8ab99b6d080fed48870335b350f30bf0c8f4d9488a9734d629e1097a0107f18f` |
+| APK size / SHA-256 | 1,340,083 B / `86c235e98c85322e67e05f668b0a9643e1df755835e3673d652ce01edb4623ce` |
 
 Not verified: the app has never been launched. There is no ARM device, emulator or `adb` in
 the build environment, so the NEON kernels are compile-verified only. On the phone, tap

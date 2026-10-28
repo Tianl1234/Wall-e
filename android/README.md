@@ -1,15 +1,20 @@
 # Wall-E — Android console
 
-An installable APK that runs the Wall-E chess engine on an Android phone, with the
+An installable APK (version 1.1) that runs the Wall-E chess engine on Android, with the
 NNUE network embedded inside the APK. It is a **console**, not a board GUI: it runs the
 engine, streams every UCI line it prints, and offers presets for the engine's own test
 commands (bench, perft, analysis).
+
+The APK is **universal**: `arm64-v8a` for phones and `x86_64` for emulators and
+Chromebooks. An APK that ships only one ABI installs on other devices but never extracts
+an engine, which is exactly the "engine binary missing" failure this build fixes; the
+app now also prints the device ABIs and the contents of `nativeLibraryDir` at startup.
 
 ## What is in the APK
 
 | Part | Contents |
 |---|---|
-| Engine | `lib/arm64-v8a/libengine.so` — the same C++ engine, cross-compiled for AArch64 |
+| Engine | `lib/arm64-v8a/libengine.so` and `lib/x86_64/libengine.so` — the same C++ engine per ABI |
 | Network | `assets/nnue/fingolfin.nnue` (extracted to app storage on first launch) |
 | UI | One activity: transcript, FEN field, command field, presets |
 
@@ -53,7 +58,7 @@ cd "android"
 bash build_apk.sh
 ```
 
-Output: `build/Wall-E-console-arm64.apk`, signed with a generated development key
+Output: `build/Wall-E-console.apk`, signed with a generated development key
 (`android/keystore/wall-e.jks`, password `walletee`, alias `walle`). That key is fine for
 sideloading; a Play Store upload would need your own keystore.
 
@@ -74,6 +79,8 @@ Toolchain paths can be overridden with `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`,
 
 Copy the APK to the phone (USB, Drive, anything), tap it, and allow installing from that
 source when Android asks. It needs no permissions, no network and no Google services.
+If the engine is reported missing, the transcript now shows the device ABIs and the
+`nativeLibraryDir` contents, which identifies an ABI mismatch immediately.
 
 ## Using it
 
@@ -96,11 +103,12 @@ Checked on this machine:
 |---|---|
 | Portable slider backend (x86, `-DWALLE_NO_PEXT`) | six standard perft positions pass; `bench 12` = 912,862 nodes, identical to the PEXT build |
 | NNUE | `NNUE loaded` on both builds; `eval` returns a value |
-| Native engine ELF | AArch64, PIE (`FLAGS_1: PIE`), entry `0x2A7F0`, no TEXTREL, only `libc`/`libm`/`libdl` needed |
-| APK manifest | `com.tianl1234.walle`, `minSdkVersion 26`, `targetSdkVersion 34`, `extractNativeLibs=true` |
-| APK contents | `classes.dex` 17,116 B; `assets/nnue/fingolfin.nnue` 1,579,010 B; `lib/arm64-v8a/libengine.so` 559,816 B |
+| Native engine ELF | arm64: AArch64 PIE, entry `0x2A7F0`; x86_64: PIE, entry `0x29730`; no TEXTREL, only `libc`/`libm`/`libdl` needed |
+| APK manifest | `com.tianl1234.walle`, versionCode 2 / versionName 1.1, `minSdkVersion 26`, `targetSdkVersion 34`, `extractNativeLibs=true` |
+| APK ABIs | `native-code: 'arm64-v8a' 'x86_64'` |
+| APK contents | `classes.dex` 17,840 B; `assets/nnue/fingolfin.nnue` 1,579,010 B; `lib/arm64-v8a/libengine.so` 559,816 B; `lib/x86_64/libengine.so` 548,600 B |
 | Signature | `apksigner verify`: exit 0, v2 and v3 schemes true |
-| APK size / SHA-256 | 1,135,211 B / `8ab99b6d080fed48870335b350f30bf0c8f4d9488a9734d629e1097a0107f18f` |
+| APK size / SHA-256 | 1,340,083 B / `86c235e98c85322e67e05f668b0a9643e1df755835e3673d652ce01edb4623ce` |
 
 Not checked: the app was never launched. This machine has no ARM CPU, no emulator and no
 `adb`, so the NEON kernels are compile-verified only. If they were wrong the engine would

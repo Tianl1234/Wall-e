@@ -3,6 +3,7 @@ package com.tianl1234.walle;
 import android.app.Activity;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.method.ScrollingMovementMethod;
 import android.util.TypedValue;
@@ -20,6 +21,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
 import java.util.Locale;
 
 /**
@@ -233,12 +235,28 @@ public final class MainActivity extends Activity implements UciEngine.Listener {
     }
 
     private void startEngine() {
-        File binary = new File(getApplicationInfo().nativeLibraryDir, ENGINE_LIBRARY);
+        // Report enough to diagnose a failed launch: a missing ABI is the classic
+        // cause of "engine binary missing" (the APK installs, but Android never
+        // extracts a library for a CPU the APK does not contain).
+        final String libDirPath = getApplicationInfo().nativeLibraryDir;
+        append("device ABIs: " + Arrays.toString(Build.SUPPORTED_ABIS));
+        append("nativeLibraryDir: " + libDirPath);
+
+        if (libDirPath == null) {
+            statusView.setText("engine: no native library dir");
+            return;
+        }
+        File libDir = new File(libDirPath);
+        File binary = new File(libDir, ENGINE_LIBRARY);
         if (!binary.isFile()) {
-            append("engine binary missing: " + binary);
+            append("engine binary missing: " + binary.getAbsolutePath());
+            append("lib dir contents: " + Arrays.toString(libDir.list()));
+            append("the APK ships arm64-v8a and x86_64; if this device reports another ABI, "
+                    + "no engine was extracted for it");
             statusView.setText("engine: missing binary");
             return;
         }
+        append("engine binary: " + binary.getAbsolutePath() + " (executable=" + binary.canExecute() + ")");
         try {
             final int generation = ++engineGeneration;
             engine = new UciEngine(binary, getFilesDir(), new UciEngine.Listener() {
@@ -255,7 +273,7 @@ public final class MainActivity extends Activity implements UciEngine.Listener {
             engine.send("isready");
             statusView.setText("engine: running (" + binary.getAbsolutePath() + ")");
         } catch (IOException e) {
-            append("failed to start engine: " + e.getMessage());
+            append("failed to start engine: " + e);
             statusView.setText("engine: failed");
         }
     }
