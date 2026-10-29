@@ -18,7 +18,8 @@ fi
 "$CXX" --version | head -1
 
 # Native Zen 5 build: AVX-512 NNUE plus the existing PEXT bitboard backend.
-"$CXX" -B"$W64DEVKIT_HOME/bin/" -O3 -march=znver5 -std=c++20 -DNDEBUG \
+# Strip release symbols so only executable code/data and the external NNUE remain.
+"$CXX" -B"$W64DEVKIT_HOME/bin/" -O3 -march=znver5 -std=c++20 -DNDEBUG -s \
        -static -static-libgcc -static-libstdc++ \
        -o chess.exe chess.cpp nnue.cpp
 

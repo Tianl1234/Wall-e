@@ -27,8 +27,8 @@ an estimate, not a measurement. What was actually measured on the build machine
 
 | Test | Result |
 |---|---|
-| bench — 6 standard positions, depth 12 | 912,862 nodes in 762 ms (**1.20 Mnps**) |
-| startpos → depth 14 | 143 ms, 264,895 nodes (**1.85 Mnps**) |
+| bench — 6 standard positions, depth 12 | 912,862 nodes in 390–395 ms (**2.31–2.34 Mnps**) |
+| startpos → depth 18 | 1,105 ms, 2,993,729 nodes (**2.71 Mnps**) |
 | perft(6) from startpos | 119,060,324 nodes in 1.97 s (**~60 Mnps**) |
 | six standard perft positions | all match (startpos, Kiwipete, positions 3–6) |
 | incremental state self-test (`verify`) | zero Zobrist / material / PSQT / NNUE mismatches |
@@ -78,10 +78,10 @@ a search. Extra console commands for testing: `d` (board + hash), `eval`, `perft
 
 ## Build
 
-The release binary is built with the [w64devkit](https://github.com/skeeto/w64devkit) GCC:
+The release binary is built with the [w64devkit](https://github.com/skeeto/w64devkit) GCC. `build.sh` strips debug/symbol tables (`-s`) to keep the executable small; the NNUE network remains a separate 1.58 MB file:
 
 ```sh
-g++ -O3 -march=znver5 -std=c++20 -DNDEBUG \
+g++ -O3 -march=znver5 -std=c++20 -DNDEBUG -s \
     -static -static-libgcc -static-libstdc++ \
     -o chess.exe chess.cpp nnue.cpp
 ```
@@ -90,6 +90,8 @@ g++ -O3 -march=znver5 -std=c++20 -DNDEBUG \
 for GUIs: a dynamically linked build needs `libstdc++-6.dll` / `libgcc_s_seh-1.dll`, which are
 not on the system PATH, and the engine then dies at process start (seen as a disconnect in
 En Croissant and Arena).
+
+On the Ryzen 9 9900X test system, the stripped executable is approximately 1.3 MiB; the previous unstripped binary was approximately 3.1 MiB. The NNUE incremental-update optimization removed redundant scratch-buffer work and roughly doubled the measured `bench 12` throughput. This is a node-rate result, not a measured Elo increase.
 
 `-march=znver5` targets Zen 4/5 (AVX-512, BMI2). On older CPUs rebuild with
 `-march=x86-64-v3` (AVX2, BMI2) or `-march=x86-64` (portable, much slower NNUE path) by

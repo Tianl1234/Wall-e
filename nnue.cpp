@@ -33,13 +33,11 @@ bool load_network(const std::string& path) {
     if (file.gcount() != static_cast<std::streamsize>(NETWORK_BYTES)) return false;
 
     auto candidate = std::make_unique<Network>();
-    std::size_t offset = 0;
-    std::copy_n(raw.data() + offset, std::size_t(INPUT_SIZE) * HIDDEN_SIZE,
-                &candidate->featureWeights[0][0]);
-    offset += std::size_t(INPUT_SIZE) * HIDDEN_SIZE;
-    std::copy_n(raw.data() + offset, HIDDEN_SIZE, candidate->bias);
+    std::memcpy(candidate->featureWeights, raw.data(), std::size_t(INPUT_SIZE) * HIDDEN_SIZE * sizeof(int16_t));
+    std::size_t offset = std::size_t(INPUT_SIZE) * HIDDEN_SIZE;
+    std::memcpy(candidate->bias, raw.data() + offset, HIDDEN_SIZE * sizeof(int16_t));
     offset += HIDDEN_SIZE;
-    std::copy_n(raw.data() + offset, HIDDEN_SIZE * 2, &candidate->outputWeights[0][0]);
+    std::memcpy(candidate->outputWeights, raw.data() + offset, HIDDEN_SIZE * 2 * sizeof(int16_t));
     offset += HIDDEN_SIZE * 2;
     candidate->outputBias = raw[offset];
     network = std::move(candidate);
@@ -53,23 +51,26 @@ inline int feature_index(int piece, int square, int perspective) {
     return ((color ^ perspective) * 6 + type - 1) * 64 + orientedSquare;
 }
 
-void add_row(int16_t* dst, const int16_t* row) {
+void update_row(int16_t* dst, const int16_t* row, bool add) {
 #if defined(__AVX512BW__) && defined(__AVX512F__)
     for (int i = 0; i < HIDDEN_SIZE; i += 32) {
         __m512i value = _mm512_load_si512(reinterpret_cast<const __m512i*>(dst + i));
         const __m512i weights = _mm512_load_si512(reinterpret_cast<const __m512i*>(row + i));
-        _mm512_store_si512(reinterpret_cast<__m512i*>(dst + i), _mm512_adds_epi16(value, weights));
+        value = add ? _mm512_adds_epi16(value, weights) : _mm512_subs_epi16(value, weights);
+        _mm512_store_si512(reinterpret_cast<__m512i*>(dst + i), value);
     }
 #elif defined(__AVX2__)
     for (int i = 0; i < HIDDEN_SIZE; i += 16) {
         __m256i value = _mm256_load_si256(reinterpret_cast<const __m256i*>(dst + i));
         const __m256i weights = _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_adds_epi16(value, weights));
+        value = add ? _mm256_adds_epi16(value, weights) : _mm256_subs_epi16(value, weights);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), value);
     }
 #else
+    const int sign = add ? 1 : -1;
     for (int i = 0; i < HIDDEN_SIZE; ++i)
         dst[i] = static_cast<int16_t>(std::clamp(
-            static_cast<int>(dst[i]) + row[i], -32768, 32767));
+            static_cast<int>(dst[i]) + sign * row[i], -32768, 32767));
 #endif
 }
 
@@ -130,47 +131,14 @@ bool available() { return static_cast<bool>(network); }
 
 void apply_changes(Accumulator& acc, const PieceChange* changes, int count) {
     if (!network || count <= 0) return;
-    alignas(64) int32_t delta[2][HIDDEN_SIZE]{};
     for (int change = 0; change < count; ++change) {
         const PieceChange& piece = changes[change];
         if (piece.type < 1 || piece.type > 6 || piece.square < 0 || piece.square >= 64) continue;
         const int pc = (piece.color << 3) | piece.type;
-        const int sign = piece.add ? 1 : -1;
         for (int perspective = 0; perspective < 2; ++perspective) {
             const int index = feature_index(pc, piece.square, perspective);
-            const int16_t* weights = network->featureWeights[index];
-            int32_t* changesForSide = delta[perspective];
-#if defined(__AVX512BW__) && defined(__AVX512F__)
-            for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-                const __m256i packed = _mm256_load_si256(reinterpret_cast<const __m256i*>(weights + i));
-                const __m512i expanded = _mm512_cvtepi16_epi32(packed);
-                const __m512i signedWeights = _mm512_mullo_epi32(expanded, _mm512_set1_epi32(sign));
-                __m512i old = _mm512_load_si512(reinterpret_cast<const __m512i*>(changesForSide + i));
-                _mm512_store_si512(reinterpret_cast<__m512i*>(changesForSide + i), _mm512_add_epi32(old, signedWeights));
-            }
-#else
-            for (int i = 0; i < HIDDEN_SIZE; ++i) changesForSide[i] += sign * weights[i];
-#endif
+            update_row(acc.values[perspective], network->featureWeights[index], piece.add);
         }
-    }
-
-    for (int perspective = 0; perspective < 2; ++perspective) {
-        int16_t* dst = acc.values[perspective];
-#if defined(__AVX512BW__) && defined(__AVX512F__)
-        const __m512i minValue = _mm512_set1_epi32(-32768);
-        const __m512i maxValue = _mm512_set1_epi32(32767);
-        for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-            const __m256i old16 = _mm256_load_si256(reinterpret_cast<const __m256i*>(dst + i));
-            const __m512i old32 = _mm512_cvtepi16_epi32(old16);
-            const __m512i change = _mm512_load_si512(reinterpret_cast<const __m512i*>(delta[perspective] + i));
-            const __m512i result = _mm512_min_epi32(_mm512_max_epi32(_mm512_add_epi32(old32, change), minValue), maxValue);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), _mm512_cvtsepi32_epi16(result));
-        }
-#else
-        for (int i = 0; i < HIDDEN_SIZE; ++i)
-            dst[i] = static_cast<int16_t>(std::clamp(
-                static_cast<int32_t>(dst[i]) + delta[perspective][i], -32768, 32767));
-#endif
     }
 }
 
@@ -183,7 +151,7 @@ void reset(Accumulator& acc, const uint8_t board[64]) {
             const int piece = board[square];
             if (!piece) continue;
             const int index = feature_index(piece, square, perspective);
-            add_row(dst, network->featureWeights[index]);
+            update_row(dst, network->featureWeights[index], true);
         }
     }
 }
