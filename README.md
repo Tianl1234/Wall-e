@@ -5,7 +5,7 @@ stack, Lazy SMP and **incremental NNUE** evaluation. It builds to one statically
 `chess.exe` with no runtime dependencies, and the evaluation network is compiled into the
 executable.
 
-**Download:** [Wall-E v1.1.0](https://github.com/Tianl1234/Wall-e/releases/tag/v1.1.0) — a single
+**Download:** [Wall-E v1.1.1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.1.1) — a single
 self-contained `chess.exe` with the NNUE network embedded. The engine reports itself as
 `Wall-E 2` over UCI.
 
@@ -52,8 +52,8 @@ single thread, shipped binary, handcrafted evaluation):
 | perft positions checked (startpos, Kiwipete, position 3) | all match the reference node counts |
 | incremental state self-test (`verify`) | zero Zobrist / material / PSQT / NNUE mismatches |
 
-The numbers published for v1.0.0 were recorded with the unusable network loaded, so they are not
-comparable with the table above; these are from v1.1.0. The engine no longer quotes an Elo
+The numbers published for earlier releases were recorded with the unusable network loaded, so they are not
+comparable with the table above; these are from v1.1.1. The engine no longer quotes an Elo
 estimate: the strongest honest statement is that it plays the search stack below at a few
 million nodes per second, and that a controlled match against a rated engine is the next step
 before claiming a rating.
@@ -128,7 +128,7 @@ without it, replace `_pext_u64` with the magic-bitboard path.
 Add `chess.exe` as a UCI engine in En Croissant, Arena, Cute Chess or BanksiaGUI. Nothing else
 is needed — the network travels inside the executable.
 
-## Changes in v1.1.0
+## Changes in v1.1.1
 
 Bug fixes found while reviewing the engine; all of them were verified on the shipped binary:
 
