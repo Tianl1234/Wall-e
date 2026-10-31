@@ -2,41 +2,61 @@
 
 A compact, fast UCI chess engine in C++20: bitboards with PEXT sliders, a full modern search
 stack, Lazy SMP and **incremental NNUE** evaluation. It builds to one statically linked
-`chess.exe` with no runtime dependencies.
+`chess.exe` with no runtime dependencies, and the evaluation network is compiled into the
+executable.
 
-**Download:** [Wall-E version 1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.0.0) —
-`chess.exe` plus the NNUE network `fingolfin.nnue`. The engine reports itself as `Wall-E 2`
-over UCI; this is the first public release.
+**Download:** [Wall-E v1.1.0](https://github.com/Tianl1234/Wall-e/releases/tag/v1.1.0) — a single
+self-contained `chess.exe` with the NNUE network embedded. The engine reports itself as
+`Wall-E 2` over UCI.
 
 ```
 Wall-e/
-  chess.exe            <- release binary (Windows x64, static)
+  chess.exe            <- release binary (Windows x64, static, network embedded)
+  chess.cpp            <- engine: search, move generation, UCI
+  nnue.cpp / nnue.h    <- incremental NNUE evaluation + handcrafted fallback
+  nnue_net.cpp         <- embeds nnue/fingolfin.nnue into chess.exe
+  build.sh             <- build script (w64devkit GCC)
   nnue/
-    fingolfin.nnue     <- evaluation network (required for full strength)
+    fingolfin.nnue     <- evaluation network (compiled into chess.exe)
+    PATRICIA-LICENSE.txt
 ```
 
-The engine looks for `nnue/fingolfin.nnue` in the working directory first, then next to the
-executable, so both layouts work. Without the network it falls back to a handcrafted
-evaluation — it still plays, but noticeably weaker.
+At startup the engine looks for `nnue/fingolfin.nnue` in the working directory, then next to the
+executable, and finally falls back to the network compiled into the binary — so one file is
+enough to run it.
+
+## Evaluation sanity check
+
+Every network that is loaded must pass a material sanity probe (pawn < minor piece < rook <
+queen, with plausible magnitudes). A network that fails it is rejected, and the engine keeps the
+handcrafted evaluation instead of silently playing badly.
+
+**The bundled `fingolfin.nnue` fails that probe** — it scores a bishop as negative and a knight
+below a pawn — so the shipped binary currently plays with the handcrafted evaluation. Probing
+about 69k feature-layout/output interpretations of that file found none that makes it sane, so
+it is a bad or mismatched network rather than a loader bug. Drop in a network trained for this
+layout (768 inputs = 2 colours × 6 piece types × 64 squares) and it is picked up automatically,
+from the file or from inside the executable.
 
 ## How strong is it?
 
 There is **no official rating yet**: Wall-E has not played a rated match, so any Elo number is
-an estimate, not a measurement. What was actually measured on the build machine
-(Ryzen 9 9900X, single thread, shipped binary, `bench 12`):
+an estimate, not a measurement. What was actually measured on the build machine (Ryzen 9 9900X,
+single thread, shipped binary, handcrafted evaluation):
 
 | Test | Result |
 |---|---|
-| bench — 6 standard positions, depth 12 | 912,862 nodes in 390–395 ms (**2.31–2.34 Mnps**) |
-| startpos → depth 18 | 1,105 ms, 2,993,729 nodes (**2.71 Mnps**) |
-| perft(6) from startpos | 119,060,324 nodes in 1.97 s (**~60 Mnps**) |
-| six standard perft positions | all match (startpos, Kiwipete, positions 3–6) |
+| bench — 6 standard positions, depth 12 | 5,454,433 nodes in 1,185 ms (**4.60 Mnps**) |
+| startpos → depth 18 | 3,778 ms, 14,435,858 nodes (**3.82 Mnps**) |
+| perft(6) from startpos | 119,060,324 nodes in 1.92 s (**~62 Mnps**) |
+| perft positions checked (startpos, Kiwipete, position 3) | all match the reference node counts |
 | incremental state self-test (`verify`) | zero Zobrist / material / PSQT / NNUE mismatches |
 
-With NNUE evaluation on top of the search stack described below, the engine is estimated to
-play in the **~2400 Elo class at blitz** on modern single-threaded hardware. That is an
-inference from the architecture and search depth, not a result of games against rated
-opponents; a controlled match against a rated engine is the next step before quoting a number.
+The numbers published for v1.0.0 were recorded with the unusable network loaded, so they are not
+comparable with the table above; these are from v1.1.0. The engine no longer quotes an Elo
+estimate: the strongest honest statement is that it plays the search stack below at a few
+million nodes per second, and that a controlled match against a rated engine is the next step
+before claiming a rating.
 
 ## Search
 
@@ -55,6 +75,8 @@ opponents; a controlled match against a rated engine is the next step before quo
 
 * NNUE: 768 inputs (own/opponent perspective × piece × square), 1024 hidden units, one
   output neuron with a quadratic activation layer in Patricia's network format
+* the network is embedded in the executable and validated by the material sanity probe above
+  before it is used
 * int16 accumulators updated **incrementally** on make/unmake, batched per move, saturating
   in SIMD (AVX-512 → AVX2 → scalar fallback)
 * handcrafted fallback: PeSTO material/PSQT plus mobility, pawn structure (doubled, isolated,
@@ -78,30 +100,51 @@ a search. Extra console commands for testing: `d` (board + hash), `eval`, `perft
 
 ## Build
 
-The release binary is built with the [w64devkit](https://github.com/skeeto/w64devkit) GCC. `build.sh` strips debug/symbol tables (`-s`) to keep the executable small; the NNUE network remains a separate 1.58 MB file:
+The release binary is built with the [w64devkit](https://github.com/skeeto/w64devkit) GCC.
+`nnue/fingolfin.nnue` must exist at build time: `nnue_net.cpp` pulls it into the executable's
+read-only data with `.incbin`, so the result is a single self-contained binary.
 
 ```sh
 g++ -O3 -march=znver5 -std=c++20 -DNDEBUG -s \
     -static -static-libgcc -static-libstdc++ \
-    -o chess.exe chess.cpp nnue.cpp
+    -o chess.exe chess.cpp nnue.cpp nnue_net.cpp
 ```
 
-`build.sh` does exactly this and is the recommended entry point. Static linking is required
-for GUIs: a dynamically linked build needs `libstdc++-6.dll` / `libgcc_s_seh-1.dll`, which are
-not on the system PATH, and the engine then dies at process start (seen as a disconnect in
-En Croissant and Arena).
+`build.sh` does exactly this (from the project root, which `.incbin` requires) and is the
+recommended entry point. Static linking is required for GUIs: a dynamically linked build needs
+`libstdc++-6.dll` / `libgcc_s_seh-1.dll`, which are not on the system PATH, and the engine then
+dies at process start (seen as a disconnect in En Croissant and Arena).
 
-On the Ryzen 9 9900X test system, the stripped executable is approximately 1.3 MiB; the previous unstripped binary was approximately 3.1 MiB. The NNUE incremental-update optimization removed redundant scratch-buffer work and roughly doubled the measured `bench 12` throughput. This is a node-rate result, not a measured Elo increase.
+The stripped executable is about 2.9 MiB, of which 1.58 MB is the embedded network; without it
+the binary is about 1.3 MiB.
 
 `-march=znver5` targets Zen 4/5 (AVX-512, BMI2). On older CPUs rebuild with
 `-march=x86-64-v3` (AVX2, BMI2) or `-march=x86-64` (portable, much slower NNUE path) by
-setting `CXXFLAGS`-equivalent flags in `build.sh`. The PEXT bitboard backend needs BMI2; on
-CPUs without it, replace `_pext_u64` with the magic-bitboard path.
+setting the equivalent flags in `build.sh`. The PEXT bitboard backend needs BMI2; on CPUs
+without it, replace `_pext_u64` with the magic-bitboard path.
 
 ## Using it in a GUI
 
-Add `chess.exe` as a UCI engine in En Croissant, Arena, Cute Chess or BanksiaGUI and keep the
-`nnue/` folder beside the executable. Nothing else is needed.
+Add `chess.exe` as a UCI engine in En Croissant, Arena, Cute Chess or BanksiaGUI. Nothing else
+is needed — the network travels inside the executable.
+
+## Changes in v1.1.0
+
+Bug fixes found while reviewing the engine; all of them were verified on the shipped binary:
+
+* **repetition detection never fired** — the history scan started one ply off, so it only ever
+  compared positions with the opposite side to move. Forced perpetuals were scored as losses
+  instead of draws. The scan is now bounded, and the history buffer compacts instead of
+  overflowing once full
+* **castling** moves were generated from FEN rights alone; rights are now validated against
+  king/rook placement, and `remove_piece` no longer uses XOR — which could fabricate a phantom
+  rook and desynchronise the position
+* `Undo` stored the halfmove clock in a `uint8_t`, silently truncating clocks above 255
+* `setoption Hash` reallocated the transposition table while the search thread was using it; the
+  search is now stopped first
+* unusable networks are rejected by the material sanity probe (see above) instead of being used
+* Lazy SMP helpers restarted iterative deepening from depth 1 on every iteration
+* the network is now compiled into `chess.exe` (`nnue_net.cpp`), so a release is one file
 
 ## License and credits
 

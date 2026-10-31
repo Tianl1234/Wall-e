@@ -1,7 +1,8 @@
 // ============================================================================
 //  Wall-E 2 — compact UCI chess engine
 //
-//  Build:  g++ -O3 -march=znver5 -std=c++20 -o chess.exe chess.cpp
+//  Build:  ./build.sh   (g++ -O3 -march=znver5 -std=c++20 chess.cpp nnue.cpp nnue_net.cpp)
+//          nnue_net.cpp embeds the network into the exe -> single-file engine.
 //
 //  Highlights
 //   * bitboards, PEXT sliders (Zen 3+ has fast PEXT/PDEP)
@@ -388,7 +389,8 @@ inline U64 bishop_att(int s, U64 occ) { return BishopTable[s][_pext_u64(occ, Bis
 struct Undo {
     U64 key;
     int mg, eg, phaseInc;
-    uint8_t castling, ep, fifty, captured;
+    int fifty;
+    uint8_t castling, ep, captured;
     uint16_t move;
 };
 
@@ -425,10 +427,10 @@ inline void add_piece(Position& p, int pc, int s) {
 
 inline void remove_piece(Position& p, int pc, int s) {
     U64 b = bit(s);
-    p.bb[pc] ^= b;
-    p.byType[pc_type(pc)] ^= b;
-    p.occ[pc >> 3] ^= b;
-    p.all ^= b;
+    p.bb[pc] &= ~b;
+    p.byType[pc_type(pc)] &= ~b;
+    p.occ[pc >> 3] &= ~b;
+    p.all &= ~b;
     p.sq[s] = EMPTY;
     const int sgn = (pc_color(pc) == WHITE) ? 1 : -1;
     p.mg -= sgn * PSQ_MG[pc][s];
@@ -441,6 +443,18 @@ inline U64 ep_key(const Position& p, int stm, int ep) {
     if (ep < 0) return 0;
     if (PawnAtt[stm ^ 1][ep] & p.bb[make_pc(stm, PAWN)]) return Zep[file_of(ep)];
     return 0;
+}
+
+// Appends the current key to the repetition history. When the buffer is full
+// the older half is dropped, so histSize never exceeds MAX_HISTORY and
+// keyHist[histSize - 1] always holds the current position's key.
+inline void push_key(Position& p) {
+    if (p.histSize >= MAX_HISTORY) {
+        const int keep = MAX_HISTORY / 2;
+        std::memmove(p.keyHist, p.keyHist + (MAX_HISTORY - keep), keep * sizeof(U64));
+        p.histSize = keep;
+    }
+    p.keyHist[p.histSize++] = p.key;
 }
 
 inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) {
@@ -456,7 +470,7 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
     u.key = p.key;
     u.castling = (uint8_t)p.castling;
     u.ep = (uint8_t)(p.ep < 0 ? 64 : p.ep);
-    u.fifty = (uint8_t)p.fifty;
+    u.fifty = p.fifty;
     u.mg = p.mg; u.eg = p.eg; u.phaseInc = p.phaseInc;
     u.move = m;
     u.captured = EMPTY;
@@ -500,8 +514,7 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
     p.key ^= ep_key(p, them, p.ep);
     p.key ^= Zcastle[p.castling];
 
-    if (p.histSize < MAX_HISTORY) p.keyHist[p.histSize] = p.key;
-    p.histSize++;
+    push_key(p);
 }
 
 inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = true) {
@@ -1016,7 +1029,7 @@ struct TT {
                 return true;
             }
         }
-        mv = b[0].move;
+        mv = 0;
         return false;
     }
 
@@ -1069,9 +1082,12 @@ inline int score_from_tt(int s, int ply) {
 //  Globals / time
 // ---------------------------------------------------------------------------
 std::atomic<bool> g_stop{false};
+std::atomic<U64> g_searchNodes{0};
 
 struct Limits {
-    int64_t soft = 0, hard = 0;
+    std::atomic<int64_t> soft{0}, hard{0};
+    std::atomic<U64> nodes{0};
+    std::atomic<bool> nodeLimit{false};
     bool infinite = false;
 };
 Limits g_lim;
@@ -1080,14 +1096,23 @@ Limits g_lim;
 struct GoParams {
     int64_t wtime = 0, btime = 0, winc = 0, binc = 0;
     int movestogo = 0, movetime = 0;
+    U64 nodes = 0;
     int stm = WHITE;
+    bool nodeLimit = false;
     bool valid = false;
 };
 GoParams g_go;
-Clock::time_point g_start;
+std::atomic<int64_t> g_startMs{0};
 
+inline int64_t clock_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count();
+}
+inline void reset_search_clock() {
+    g_startMs.store(clock_ms(), std::memory_order_relaxed);
+}
 inline int64_t elapsed_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_start).count();
+    return clock_ms() - g_startMs.load(std::memory_order_relaxed);
 }
 
 struct ThreadData {
@@ -1102,13 +1127,16 @@ struct ThreadData {
     int seldepth = 0;
     int id = 0;
 
-    void init() {
+    void init(bool clearHistory = true) {
         std::memset(killers, 0, sizeof(killers));
-        std::memset(counter, 0, sizeof(counter));
-        std::memset(history, 0, sizeof(history));
         std::memset(moveStack, 0, sizeof(moveStack));
         for (int i = 0; i < MAX_PLY + 2; ++i) evalStack[i] = VALUE_NONE;
-        contHist.assign(16 * 64 * 16 * 64, 0);
+        if (clearHistory) {
+            std::memset(counter, 0, sizeof(counter));
+            std::memset(history, 0, sizeof(history));
+            std::fill(contHist.begin(), contHist.end(), 0);
+        }
+        if (contHist.empty()) contHist.resize(16 * 64 * 16 * 64, 0);
     }
     inline int16_t* ch(int prevPc, int prevTo, int pc, int to) {
         return &contHist[(((prevPc * 64) + prevTo) * 16 + pc) * 64 + to];
@@ -1120,47 +1148,73 @@ std::vector<ThreadData*> threads;
 inline bool check_stop(ThreadData& T) {
     if (g_stop.load(std::memory_order_relaxed)) return true;
     if (T.id != 0) return false;
-    if (g_lim.hard > 0 && elapsed_ms() >= g_lim.hard) {
+    const int64_t hard = g_lim.hard.load(std::memory_order_relaxed);
+    if (hard > 0 && elapsed_ms() >= hard) {
         g_stop.store(true, std::memory_order_relaxed);
         return true;
     }
     return false;
 }
 
+inline bool enter_node(ThreadData& T) {
+    if (g_stop.load(std::memory_order_relaxed)) return false;
+
+    if (g_lim.nodeLimit.load(std::memory_order_relaxed)) {
+        U64 count = g_searchNodes.load(std::memory_order_relaxed);
+        const U64 limit = g_lim.nodes.load(std::memory_order_relaxed);
+        while (count < limit &&
+               !g_searchNodes.compare_exchange_weak(count, count + 1,
+                                                    std::memory_order_relaxed)) {}
+        if (count >= limit) {
+            g_stop.store(true, std::memory_order_relaxed);
+            return false;
+        }
+    } else {
+        g_searchNodes.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ++T.nodes;
+    if (T.id == 0 && (T.nodes & 1023) == 0 && check_stop(T)) return false;
+    return true;
+}
+
 inline bool is_repetition(const Position& p) {
-    int end = std::max(0, p.histSize - p.fifty - 1);
-    for (int i = p.histSize - 2; i >= end; i -= 2)
+    // keyHist[histSize - 1] is the current position's own key, so positions
+    // that can repeat it (same side to move) sit at histSize - 3, - 5, ...
+    const int end = std::max(0, p.histSize - p.fifty - 1);
+    for (int i = p.histSize - 3; i >= end; i -= 2)
         if (p.keyHist[i] == p.key) return true;
     return false;
 }
 
-struct NullUndo { int ep, fifty; U64 key; };
+struct NullUndo { int ep, fifty; U64 key; uint16_t move; };
 
-inline void make_null(Position& p, NullUndo& nu) {
+inline void make_null(ThreadData& T, Position& p, NullUndo& nu, int ply) {
     nu.ep = p.ep; nu.fifty = p.fifty; nu.key = p.key;
+    nu.move = T.moveStack[ply];
+    T.moveStack[ply] = 0;
     p.key ^= ep_key(p, p.stm, p.ep);
     p.ep = -1;
     p.stm ^= 1;
     p.key ^= Zside;
     p.fifty++;
-    if (p.histSize < MAX_HISTORY) p.keyHist[p.histSize] = p.key;
-    p.histSize++;
+    push_key(p);
 }
 
-inline void unmake_null(Position& p, const NullUndo& nu) {
+inline void unmake_null(ThreadData& T, Position& p, const NullUndo& nu, int ply) {
     p.histSize--;
     p.stm ^= 1;
     p.ep = nu.ep;
     p.fifty = nu.fifty;
     p.key = nu.key;
+    T.moveStack[ply] = nu.move;
 }
 
 // ---------------------------------------------------------------------------
 //  Quiescence
 // ---------------------------------------------------------------------------
 int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
-    T.nodes++;
-    if ((T.nodes & 1023) == 0 && check_stop(T)) return 0;
+    if (!enter_node(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
     if (ply >= MAX_PLY - 2) return evaluate(pos);
     // a repetition needs at least four plies since the last irreversible move
@@ -1185,13 +1239,13 @@ int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
         const uint16_t m = ml.m[i];
         const int mt = mv_type(m);
         int s;
-        if (is_capture(mt)) {
+        if (is_promo(mt)) {
+            s = 50000 + promo_type(mt);
+        } else if (is_capture(mt)) {
             int victim = (mt == MT_EP) ? PAWN : pc_type(pos.sq[mv_to(m)]);
             int attacker = pc_type(pos.sq[mv_from(m)]);
             if (SEE_VAL[victim] < SEE_VAL[attacker]) s = -100000 + victim;
             else                                     s = victim * 64 - attacker;
-        } else if (is_promo(mt)) {
-            s = 50000 + promo_type(mt);
         } else {
             s = 0;
         }
@@ -1238,8 +1292,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
 
     if (depth <= 0) return qsearch(T, pos, alpha, beta, ply);
 
-    T.nodes++;
-    if ((T.nodes & 1023) == 0 && check_stop(T)) return 0;
+    if (!enter_node(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
     if (ply >= MAX_PLY - 2) return evaluate(pos);
 
@@ -1287,9 +1340,9 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
         int R = 3 + depth / 5 + std::min(3, (eval - beta) / 200);
         if (R > depth - 2) R = std::max(1, depth - 2);
         NullUndo nu;
-        make_null(pos, nu);
+        make_null(T, pos, nu, ply);
         int v = -negamax(T, pos, depth - R - 1, -beta, -beta + 1, ply + 1, !cutNode);
-        unmake_null(pos, nu);
+        unmake_null(T, pos, nu, ply);
         if (g_stop.load(std::memory_order_relaxed)) return 0;
         if (v >= beta) return (v >= MATE_IN_MAX) ? beta : v;
     }
@@ -1357,6 +1410,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
     int bestScore = -INF;
     uint16_t bestMove = 0;
     int moveCount = 0;
+    int quietCount = 0;
     bool skipQuiets = false;
     uint16_t quietTried[64];
     int nQuiet = 0;
@@ -1378,7 +1432,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
 
         if (!chk && !pv && moveCount > 0 && bestScore > -MATE_IN_MAX) {
             if (!cap && !promo) {
-                if (moveCount >= lmpLimit) { skipQuiets = true; continue; }
+                if (quietCount >= lmpLimit) { skipQuiets = true; continue; }
                 if (futilityOk && eval + 110 + 95 * depth <= alpha) { skipQuiets = true; continue; }
             } else if (depth <= 6 && !see_ge(pos, m, -110)) {
                 continue;
@@ -1394,6 +1448,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
 
         T.moveStack[ply] = m;
         moveCount++;
+        if (!cap && !promo) quietCount++;
 
         int score;
         if (moveCount == 1) {
@@ -1472,7 +1527,7 @@ std::string move_str(const Position&, uint16_t m) {
     s += char('a' + file_of(mv_to(m)));
     s += char('1' + rank_of(mv_to(m)));
     if (is_promo(mv_type(m))) {
-        const char pc[] = {' ', 'n', 'b', 'r', 'q'};
+        const char pc[] = {' ', ' ', 'n', 'b', 'r', 'q'};
         s += pc[promo_type(mv_type(m))];
     }
     return s;
@@ -1520,7 +1575,7 @@ struct RootMove {
     int score;
 };
 
-void iterate(ThreadData& T, int maxDepth, bool mainThread) {
+void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
     Position& pos = T.pos;
 
     MoveList ml;
@@ -1542,14 +1597,16 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread) {
     int prevScore = 0;
     int delta = 16;
     T.nodes = 0;          // cumulative for this iterate() call
+    T.evalStack[0] = evaluate(pos);
 
-    for (int d = 1; d <= maxDepth; ++d) {
-        if (mainThread && d > 1 && g_lim.soft > 0 && elapsed_ms() >= g_lim.soft) break;
+    for (int d = startDepth; d <= maxDepth; ++d) {
+        const int64_t soft = g_lim.soft.load(std::memory_order_relaxed);
+        if (mainThread && d > 1 && soft > 0 && elapsed_ms() >= soft) break;
 
         T.seldepth = 0;
 
         int alpha, beta;
-        if (d == 1) { alpha = -INF; beta = INF; }
+        if (d == startDepth) { alpha = -INF; beta = INF; }
         else {
             alpha = std::max(-INF, prevScore - delta);
             beta  = std::min(INF, prevScore + delta);
@@ -1601,11 +1658,12 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread) {
 
         if (mainThread) {
             int64_t ms = elapsed_ms();
-            U64 nps = ms ? (T.nodes * 1000ULL / (U64)ms) : 0;
+            U64 nodes = g_searchNodes.load(std::memory_order_relaxed);
+            U64 nps = ms ? (nodes * 1000ULL / (U64)ms) : 0;
             std::cout << "info depth " << d
                       << " seldepth " << T.seldepth
                       << " score " << score_string(prevScore)
-                      << " nodes " << T.nodes
+                      << " nodes " << nodes
                       << " nps " << nps
                       << " hashfull " << tt.hashfull()
                       << " time " << ms
@@ -1614,17 +1672,20 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread) {
         }
 
         if (std::abs(prevScore) > MATE_IN_MAX) break;
-        if (mainThread && g_lim.soft > 0 && elapsed_ms() >= g_lim.soft) break;
+        const int64_t softNow = g_lim.soft.load(std::memory_order_relaxed);
+        if (mainThread && softNow > 0 && elapsed_ms() >= softNow) break;
     }
 
     if (mainThread) std::cout << "bestmove " << move_str(pos, bestMove) << std::endl;
 }
 
 void helper_main(ThreadData* T, int maxDepth) {
-    int phase = T->id & 1;
-    for (int d = 1; d <= maxDepth; ++d) {
+    // iterate() already runs its own iterative-deepening loop, so drive it one
+    // depth at a time instead of restarting from depth 1 on every iteration.
+    // The id & 1 offset gives the helper threads a small diversity gap.
+    for (int d = 1 + (T->id & 1); d <= maxDepth; ++d) {
         if (g_stop.load(std::memory_order_relaxed)) break;
-        iterate(*T, std::min(maxDepth, d + phase), false);
+        iterate(*T, d, false, d);
     }
 }
 
@@ -1693,6 +1754,15 @@ bool set_fen(Position& p, const std::string& fen) {
             default: break;
         }
     }
+    // Drop any right the placement does not actually support: otherwise a
+    // malformed FEN would let gen_all emit a castling move whose rook does not
+    // exist, and executing it would corrupt the bitboards.
+    if (!(p.bb[W_K] & bit(4)))  p.castling &= ~3;
+    if (!(p.bb[B_K] & bit(60))) p.castling &= ~12;
+    if (!(p.bb[W_R] & bit(7)))  p.castling &= ~1;
+    if (!(p.bb[W_R] & bit(0)))  p.castling &= ~2;
+    if (!(p.bb[B_R] & bit(63))) p.castling &= ~4;
+    if (!(p.bb[B_R] & bit(56))) p.castling &= ~8;
     if (ep != "-" && ep.size() >= 2)
         p.ep = (ep[1] - '1') * 8 + (ep[0] - 'a');
 
@@ -1801,13 +1871,16 @@ void stop_search() {
 }
 
 void apply_go_limits(const GoParams& gp, bool infinite) {
-    g_lim.soft = 0;
-    g_lim.hard = 0;
+    g_lim.soft.store(0, std::memory_order_relaxed);
+    g_lim.hard.store(0, std::memory_order_relaxed);
+    g_lim.nodes.store(gp.nodes, std::memory_order_relaxed);
+    g_lim.nodeLimit.store(gp.nodeLimit, std::memory_order_relaxed);
     g_lim.infinite = infinite;
 
     if (gp.movetime > 0) {
-        g_lim.hard = std::max<int64_t>(1, gp.movetime - g_moveOverhead);
-        g_lim.soft = std::max<int64_t>(1, g_lim.hard * 6 / 10);
+        const int64_t hard = std::max<int64_t>(1, gp.movetime - g_moveOverhead);
+        g_lim.hard.store(hard, std::memory_order_relaxed);
+        g_lim.soft.store(std::max<int64_t>(1, hard * 6 / 10), std::memory_order_relaxed);
     } else if (!infinite && (gp.wtime > 0 || gp.btime > 0)) {
         int64_t myTime = (gp.stm == WHITE) ? gp.wtime : gp.btime;
         int64_t myInc  = (gp.stm == WHITE) ? gp.winc : gp.binc;
@@ -1817,9 +1890,12 @@ void apply_go_limits(const GoParams& gp, bool infinite) {
         opt = std::min<int64_t>(opt, usable / 2);
         opt = std::max<int64_t>(opt, 1);
         int64_t hard = std::min<int64_t>(usable, opt * 3);
-        g_lim.soft = opt;
-        g_lim.hard = std::max<int64_t>(hard, opt + 5);
-        if (myTime < 60) { g_lim.soft = 1; g_lim.hard = std::max<int64_t>(1, myTime / 2); }
+        g_lim.soft.store(opt, std::memory_order_relaxed);
+        g_lim.hard.store(std::max<int64_t>(hard, opt + 5), std::memory_order_relaxed);
+        if (myTime < 60) {
+            g_lim.soft.store(1, std::memory_order_relaxed);
+            g_lim.hard.store(std::max<int64_t>(1, myTime / 2), std::memory_order_relaxed);
+        }
     }
 }
 
@@ -1828,9 +1904,20 @@ void init_threads(int n, const Position* seed = nullptr) {
     if (seed) keep = *seed;
     else if (!threads.empty()) keep = threads[0]->pos;
 
-    for (auto* t : threads) delete t;
-    threads.clear();
-    for (int i = 0; i < n; ++i) {
+    // Keep the root ThreadData allocation stable: main() holds a reference to
+    // threads[0]->pos while UCI commands may change the thread count.
+    if (threads.empty()) {
+        threads.push_back(new ThreadData());
+    } else {
+        for (size_t i = 1; i < threads.size(); ++i) delete threads[i];
+        threads.resize(1);
+    }
+
+    ThreadData* root = threads[0];
+    root->init();
+    root->id = 0;
+    root->pos = keep;
+    for (int i = 1; i < n; ++i) {
         ThreadData* T = new ThreadData();
         T->init();
         T->id = i;
@@ -1842,13 +1929,14 @@ void init_threads(int n, const Position* seed = nullptr) {
 void start_search(int maxDepth) {
     if (g_searching.load()) stop_search();
     g_stop.store(false, std::memory_order_relaxed);
-    g_start = Clock::now();
+    g_searchNodes.store(0, std::memory_order_relaxed);
+    reset_search_clock();
     if (tt.gen < 63) tt.gen++; else { tt.gen = 1; }
-    for (auto* T : threads) T->init();
-
     if ((int)threads.size() != g_threadCount) {
         Position seed = threads[0]->pos;
         init_threads(g_threadCount, &seed);
+    } else {
+        for (auto* T : threads) T->init(false);
     }
     if (threads.size() > 1) {
         for (size_t i = 1; i < threads.size(); ++i) threads[i]->pos = threads[0]->pos;
@@ -1875,6 +1963,11 @@ int main(int argc, char** argv) {
         const auto exeDir = std::filesystem::absolute(argv[0]).parent_path();
         evalFile = (exeDir / "nnue" / "fingolfin.nnue").string();
         loaded = Nnue::load(evalFile);
+    }
+    // single-file distribution: the network is compiled into the executable
+    if (!loaded) {
+        loaded = Nnue::load_embedded();
+        if (loaded) evalFile += " (embedded)";
     }
     if (loaded) std::cerr << "info string NNUE loaded: " << evalFile << '\n';
     else std::cerr << "info string NNUE unavailable; using handcrafted evaluation\n";
@@ -1909,7 +2002,7 @@ int main(int argc, char** argv) {
             while (iss >> w && w != "value") { if (!name.empty()) name += ' '; name += w; }
             std::getline(iss, val);
             if (!val.empty() && val[0] == ' ') val.erase(0, 1);
-            if (name == "Hash") { g_hashMB = std::atoi(val.c_str()); tt.resize(g_hashMB); }
+            if (name == "Hash") { stop_search(); g_hashMB = std::atoi(val.c_str()); tt.resize(g_hashMB); }
             else if (name == "Threads") { g_threadCount = std::max(1, std::atoi(val.c_str())); }
             else if (name == "Move Overhead") { g_moveOverhead = std::max(0, std::atoi(val.c_str())); }
             else if (name == "EvalFile") {
@@ -1965,6 +2058,8 @@ int main(int argc, char** argv) {
         else if (token == "go") {
             int64_t wtime = 0, btime = 0, winc = 0, binc = 0;
             int movestogo = 0, movetime = 0, maxDepth = 64;
+            int64_t requestedNodes = 0;
+            bool hasNodeLimit = false;
             bool infinite = false;
             std::string w;
             while (iss >> w) {
@@ -1976,7 +2071,9 @@ int main(int argc, char** argv) {
                 else if (w == "movetime")  iss >> movetime;
                 else if (w == "depth")     iss >> maxDepth;
                 else if (w == "infinite")  infinite = true;
-                else if (w == "nodes")     { int64_t dummy; iss >> dummy; }
+                else if (w == "nodes") {
+                    if (iss >> requestedNodes) hasNodeLimit = true;
+                }
                 else if (w == "ponder")    infinite = true;
             }
 
@@ -1984,6 +2081,8 @@ int main(int argc, char** argv) {
             g_go.wtime = wtime; g_go.btime = btime;
             g_go.winc = winc;   g_go.binc = binc;
             g_go.movestogo = movestogo; g_go.movetime = movetime;
+            g_go.nodes = static_cast<U64>(std::max<int64_t>(0, requestedNodes));
+            g_go.nodeLimit = hasNodeLimit;
             g_go.stm = board.stm;
             g_go.valid = true;
             apply_go_limits(g_go, infinite);
@@ -2002,7 +2101,11 @@ int main(int argc, char** argv) {
             // stop pondering and finish the move on the real clock
             if (g_searching.load()) {
                 if (g_go.valid) apply_go_limits(g_go, false);
-                if (g_lim.hard == 0) { g_lim.soft = 1000; g_lim.hard = 3000; }
+                if (g_lim.hard.load(std::memory_order_relaxed) == 0) {
+                    g_lim.soft.store(1000, std::memory_order_relaxed);
+                    g_lim.hard.store(3000, std::memory_order_relaxed);
+                }
+                reset_search_clock();
             }
         }
         else if (token == "quit") {
@@ -2074,8 +2177,12 @@ int main(int argc, char** argv) {
             for (const char* f : benchFens) {
                 set_fen(threads[0]->pos, f);
                 g_stop.store(false, std::memory_order_relaxed);
-                g_lim.soft = g_lim.hard = 0;
-                g_start = Clock::now();
+                g_lim.soft.store(0, std::memory_order_relaxed);
+                g_lim.hard.store(0, std::memory_order_relaxed);
+                g_lim.nodeLimit.store(false, std::memory_order_relaxed);
+                g_lim.nodes.store(0, std::memory_order_relaxed);
+                g_searchNodes.store(0, std::memory_order_relaxed);
+                reset_search_clock();
                 tt.gen = (tt.gen < 63) ? tt.gen + 1 : 1;
                 iterate(*threads[0], depth, false);
                 total += threads[0]->nodes;

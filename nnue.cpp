@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <immintrin.h>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,23 +26,46 @@ struct alignas(64) Network {
 };
 std::unique_ptr<Network> network;
 
+bool network_sane();
+
+bool parse_network(const int16_t* raw, const char* label) {
+    auto candidate = std::make_unique<Network>();
+    std::memcpy(candidate->featureWeights, raw, std::size_t(INPUT_SIZE) * HIDDEN_SIZE * sizeof(int16_t));
+    std::size_t offset = std::size_t(INPUT_SIZE) * HIDDEN_SIZE;
+    std::memcpy(candidate->bias, raw + offset, HIDDEN_SIZE * sizeof(int16_t));
+    offset += HIDDEN_SIZE;
+    std::memcpy(candidate->outputWeights, raw + offset, HIDDEN_SIZE * 2 * sizeof(int16_t));
+    offset += HIDDEN_SIZE * 2;
+    candidate->outputBias = raw[offset];
+
+    // The SIMD inference path multiplies clipped activations (0..255) by
+    // signed weights in 16-bit lanes before widening. Keep the product within
+    // int16_t so a replacement/retrained network cannot silently wrap.
+    for (const auto& perspective : candidate->outputWeights)
+        for (int16_t weight : perspective)
+            if (weight < -128 || weight > 128) return false;
+
+    network = std::move(candidate);
+    // A network whose material ordering is nonsense, or that does not match
+    // this code's feature layout, would silently ruin every evaluation.
+    // Reject it so the caller can fall back to the handcrafted evaluation.
+    if (!network_sane()) {
+        network.reset();
+        std::cerr << "info string NNUE: " << label
+                  << " fails material sanity checks; rejected\n";
+        return false;
+    }
+    return true;
+}
+
 bool load_network(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) return false;
     std::vector<int16_t> raw(NETWORK_BYTES / sizeof(int16_t));
     file.read(reinterpret_cast<char*>(raw.data()), NETWORK_BYTES);
     if (file.gcount() != static_cast<std::streamsize>(NETWORK_BYTES)) return false;
-
-    auto candidate = std::make_unique<Network>();
-    std::memcpy(candidate->featureWeights, raw.data(), std::size_t(INPUT_SIZE) * HIDDEN_SIZE * sizeof(int16_t));
-    std::size_t offset = std::size_t(INPUT_SIZE) * HIDDEN_SIZE;
-    std::memcpy(candidate->bias, raw.data() + offset, HIDDEN_SIZE * sizeof(int16_t));
-    offset += HIDDEN_SIZE;
-    std::memcpy(candidate->outputWeights, raw.data() + offset, HIDDEN_SIZE * 2 * sizeof(int16_t));
-    offset += HIDDEN_SIZE * 2;
-    candidate->outputBias = raw[offset];
-    network = std::move(candidate);
-    return true;
+    if (file.peek() != std::char_traits<char>::eof()) return false;
+    return parse_network(raw.data(), path.c_str());
 }
 
 inline int feature_index(int piece, int square, int perspective) {
@@ -124,9 +148,53 @@ int infer(const Accumulator& acc, int stm) {
     return static_cast<int>((total * SCALE) /
                             (static_cast<int64_t>(QA) * QA * 64));
 }
+
+// Cheap sanity probe: evaluate a bare-kings position and the same position with
+// one extra white piece (pawn/knight/bishop/rook/queen on d4), all with white
+// to move. A usable network must return a sane, monotone material ordering;
+// anything else (a mismatched or corrupt file) is refused by the loader so the
+// engine keeps the handcrafted evaluation instead of a broken one.
+bool network_sane() {
+    if (!network) return false;
+
+    static const int probeType[5] = {1, 2, 3, 4, 5};  // pawn, knight, bishop, rook, queen
+
+    uint8_t bare[64] = {};
+    bare[4]  = 6;    // white king e1
+    bare[60] = 14;   // black king e8
+    Accumulator baseline{};
+    reset(baseline, bare);
+    const int zero = infer(baseline, 0);
+
+    int val[5];
+    for (int t = 0; t < 5; ++t) {
+        uint8_t board[64] = {};
+        board[4]  = 6;
+        board[60] = 14;
+        board[27] = static_cast<uint8_t>(probeType[t]);   // extra white piece on d4
+        Accumulator acc{};
+        reset(acc, board);
+        val[t] = infer(acc, 0) - zero;
+    }
+
+    if (val[0] < 20) return false;                                   // a pawn must be worth something
+    if (val[1] <= val[0] || val[2] <= val[0]) return false;           // minors beat a pawn
+    if (val[3] <= val[1] || val[3] <= val[2]) return false;           // a rook beats the minors
+    if (val[4] <= val[3]) return false;                               // a queen beats a rook
+    return val[4] >= 300 && val[4] <= 2500;                           // and everything is on a sane scale
+}
 } // namespace
 
 bool load(const std::string& networkPath) { return load_network(networkPath); }
+
+bool load_embedded() {
+    std::size_t size = 0;
+    const unsigned char* bytes = embedded_network(size);
+    if (!bytes || size != NETWORK_BYTES) return false;
+    std::vector<int16_t> raw(NETWORK_BYTES / sizeof(int16_t));
+    std::memcpy(raw.data(), bytes, NETWORK_BYTES);
+    return parse_network(raw.data(), "<embedded network>");
+}
 bool available() { return static_cast<bool>(network); }
 
 void apply_changes(Accumulator& acc, const PieceChange* changes, int count) {
