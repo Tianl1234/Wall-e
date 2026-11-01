@@ -149,32 +149,40 @@ int infer(const Accumulator& acc, int stm) {
                             (static_cast<int64_t>(QA) * QA * 64));
 }
 
-// Cheap sanity probe: evaluate a bare-kings position and the same position with
-// one extra white piece (pawn/knight/bishop/rook/queen on d4), all with white
-// to move. A usable network must return a sane, monotone material ordering;
-// anything else (a mismatched or corrupt file) is refused by the loader so the
-// engine keeps the handcrafted evaluation instead of a broken one.
+// Sanity probe on a realistic position. The network drives every evaluation, so a
+// corrupt or mismatched file would silently ruin the engine; the probe has to
+// reject that without rejecting a good network. Bare-kings material probes are
+// not usable for this: a lone minor piece, or a pawn that cannot promote, is a
+// dead draw, so a correctly trained network rates it near zero and the ordering
+// test fails on a good file. Take the start position instead and remove one white
+// piece at a time: the deltas must look like real material values.
 bool network_sane() {
     if (!network) return false;
 
-    static const int probeType[5] = {1, 2, 3, 4, 5};  // pawn, knight, bishop, rook, queen
+    const uint8_t backRank[8] = {4, 2, 3, 5, 6, 3, 2, 4};   // R N B Q K B N R
+    uint8_t board[64] = {};
+    for (int file = 0; file < 8; ++file) {
+        board[file] = backRank[file];
+        board[8 + file] = 1;   // white pawns
+        board[48 + file] = 9;  // black pawns
+        board[56 + file] = static_cast<uint8_t>(backRank[file] + 8);
+    }
 
-    uint8_t bare[64] = {};
-    bare[4]  = 6;    // white king e1
-    bare[60] = 14;   // black king e8
-    Accumulator baseline{};
-    reset(baseline, bare);
-    const int zero = infer(baseline, 0);
+    Accumulator acc{};
+    reset(acc, board);
+    const int start = infer(acc, 0);
+    if (start < -400 || start > 400) return false;
 
+    // a2 pawn, b1 knight, c1 bishop, a1 rook, d1 queen
+    const int pieceSquare[5] = {8, 1, 2, 0, 3};
     int val[5];
     for (int t = 0; t < 5; ++t) {
-        uint8_t board[64] = {};
-        board[4]  = 6;
-        board[60] = 14;
-        board[27] = static_cast<uint8_t>(probeType[t]);   // extra white piece on d4
-        Accumulator acc{};
+        const int sq = pieceSquare[t];
+        const uint8_t saved = board[sq];
+        board[sq] = 0;
         reset(acc, board);
-        val[t] = infer(acc, 0) - zero;
+        val[t] = start - infer(acc, 0);   // positive: removing the piece costs this much
+        board[sq] = saved;
     }
 
     if (val[0] < 20) return false;                                   // a pawn must be worth something

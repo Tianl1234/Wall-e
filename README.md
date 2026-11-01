@@ -5,7 +5,7 @@ stack, Lazy SMP and **incremental NNUE** evaluation. It builds to one statically
 `chess.exe` with no runtime dependencies, and the evaluation network is compiled into the
 executable.
 
-**Download:** [Wall-E v1.1.1](https://github.com/Tianl1234/Wall-e/releases/tag/v1.1.1) — a single
+**Download:** [Wall-E v1.1.2](https://github.com/Tianl1234/Wall-e/releases/tag/v1.1.2) — a single
 self-contained `chess.exe` with the NNUE network embedded. The engine reports itself as
 `Wall-E 2` over UCI.
 
@@ -27,36 +27,39 @@ enough to run it.
 
 ## Evaluation sanity check
 
-Every network that is loaded must pass a material sanity probe (pawn < minor piece < rook <
-queen, with plausible magnitudes). A network that fails it is rejected, and the engine keeps the
-handcrafted evaluation instead of silently playing badly.
+Every network that is loaded must pass a material sanity probe before it is used, so a corrupt
+or mismatched file cannot silently ruin the evaluation and make a GUI's evaluation bar
+meaningless. The probe takes the **start position** and removes one white piece at a time
+(pawn, knight, bishop, rook, queen): the resulting deltas have to form a sane material scale.
 
-**The bundled `fingolfin.nnue` fails that probe** — it scores a bishop as negative and a knight
-below a pawn — so the shipped binary currently plays with the handcrafted evaluation. Probing
-about 69k feature-layout/output interpretations of that file found none that makes it sane, so
-it is a bad or mismatched network rather than a loader bug. Drop in a network trained for this
-layout (768 inputs = 2 colours × 6 piece types × 64 squares) and it is picked up automatically,
-from the file or from inside the executable.
+It deliberately avoids bare-kings positions. A lone minor piece, or a pawn that cannot promote,
+is a dead draw, so a correctly trained network rates it near zero — an ordering test there
+rejects perfectly good networks (it did, in v1.1.0/v1.1.1).
+
+The bundled `fingolfin.nnue` passes comfortably. Measured with this build, removing a white
+piece from the start position costs: pawn 49 cp, knight 483, bishop 500, rook 641, queen 1033 —
+a normal trained-network scale. A network that does fail the probe is rejected and the engine
+keeps the handcrafted evaluation instead. A network trained for this layout (768 inputs =
+2 colours × 6 piece types × 64 squares) is picked up automatically, from the file or from inside
+the executable.
 
 ## How strong is it?
 
 There is **no official rating yet**: Wall-E has not played a rated match, so any Elo number is
 an estimate, not a measurement. What was actually measured on the build machine (Ryzen 9 9900X,
-single thread, shipped binary, handcrafted evaluation):
+single thread, shipped binary, NNUE evaluation active):
 
 | Test | Result |
 |---|---|
-| bench — 6 standard positions, depth 12 | 5,454,433 nodes in 1,185 ms (**4.60 Mnps**) |
-| startpos → depth 18 | 3,778 ms, 14,435,858 nodes (**3.82 Mnps**) |
-| perft(6) from startpos | 119,060,324 nodes in 1.92 s (**~62 Mnps**) |
+| bench — 6 standard positions, depth 12 | 852,295 nodes in 342 ms (**2.49 Mnps**) |
+| startpos → depth 18 | 1,092 ms, 2,988,534 nodes (**2.74 Mnps**) |
+| perft(6) from startpos | 119,060,324 nodes in 1.93 s (**~62 Mnps**) |
 | perft positions checked (startpos, Kiwipete, position 3) | all match the reference node counts |
 | incremental state self-test (`verify`) | zero Zobrist / material / PSQT / NNUE mismatches |
 
-The numbers published for earlier releases were recorded with the unusable network loaded, so they are not
-comparable with the table above; these are from v1.1.1. The engine no longer quotes an Elo
-estimate: the strongest honest statement is that it plays the search stack below at a few
-million nodes per second, and that a controlled match against a rated engine is the next step
-before claiming a rating.
+These figures are from v1.1.2, which restores NNUE evaluation. The v1.1.0/v1.1.1 numbers were
+taken with the network rejected and are not comparable. The engine does not quote an Elo
+estimate: a controlled match against a rated engine is the next step before claiming a rating.
 
 ## Search
 
@@ -75,7 +78,7 @@ before claiming a rating.
 
 * NNUE: 768 inputs (own/opponent perspective × piece × square), 1024 hidden units, one
   output neuron with a quadratic activation layer in Patricia's network format
-* the network is embedded in the executable and validated by the material sanity probe above
+* the network is embedded in the executable and checked by the material sanity probe above
   before it is used
 * int16 accumulators updated **incrementally** on make/unmake, batched per move, saturating
   in SIMD (AVX-512 → AVX2 → scalar fallback)
@@ -127,6 +130,18 @@ without it, replace `_pext_u64` with the magic-bitboard path.
 
 Add `chess.exe` as a UCI engine in En Croissant, Arena, Cute Chess or BanksiaGUI. Nothing else
 is needed — the network travels inside the executable.
+
+## Changes in v1.1.2
+
+The sanity probe added in v1.1.1 was wrong, and this release corrects it. It probed bare-kings
+positions holding a single piece and required a monotone material ordering there. Those
+positions are outside a trained network's distribution — a lone bishop or knight cannot mate, so
+the network correctly rates such positions as a draw — and the probe therefore rejected a
+perfectly good network and left the engine playing with the handcrafted evaluation.
+
+The probe now measures the start position, and the shipped binary evaluates with NNUE again:
+removing a white piece from the start position costs 49 cp for the a2 pawn, 483 for the knight,
+500 for the bishop, 641 for the rook and 1033 for the queen.
 
 ## Changes in v1.1.1
 
