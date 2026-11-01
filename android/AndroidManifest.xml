@@ -16,6 +16,11 @@
 
     The binary is an ordinary UCI program; the ".so" name only exists so the package
     manager treats it as a native library.
+
+    build_apk.sh copies this file and rewrites the application id, label and provider
+    authority for the variant it is building ("tiny" or "strong"). The component names
+    are therefore fully qualified: with a rewritten package attribute a leading dot
+    would resolve into a package that does not hold these classes.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.tianl1234.walle"
@@ -32,7 +37,7 @@
         <!-- Marker activity: GUIs query for the ENGINE action to find providers.
              It has no UI and finishes immediately. -->
         <activity
-            android:name=".EngineActivity"
+            android:name="com.tianl1234.walle.EngineActivity"
             android:exported="true"
             android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
@@ -50,7 +55,7 @@
         <!-- Serves the engine binary (assets first, then nativeLibraryDir), for GUIs
              that copy the engine out of the package instead of executing it in place. -->
         <provider
-            android:name=".EngineProvider"
+            android:name="com.tianl1234.walle.EngineProvider"
             android:authorities="com.tianl1234.walle.EngineProvider"
             android:exported="true" />
     </application>

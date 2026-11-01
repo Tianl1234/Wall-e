@@ -38,9 +38,34 @@ KEY_PASS="walletee"
 KEY_ALIAS="walle"
 
 OUT="$PROJECT/build/apk"
-APK="$PROJECT/build/Wall-E-engine.apk"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# Both packages are built from the same sources; the variant decides how many
+# networks are embedded and under which application id it is published, so the two
+# can be installed side by side.
+#
+#   tiny   - one network (fingolfin), the package published so far
+#   strong - three networks, one per game phase (see WALLE_PHASE_NETS in chess.cpp)
+VARIANT="${VARIANT:-tiny}"
+case "$VARIANT" in
+    tiny)
+        APP_ID="com.tianl1234.walle"
+        APP_LABEL="Wall-E Chess Engine"
+        ENGINE_NAME="Wall-E 1.3.2"
+        EXTRA_CXXFLAGS=()
+        APK_NAME="wall-e.tiny.apk"
+        ;;
+    strong)
+        APP_ID="com.tianl1234.walle.strong"
+        APP_LABEL="Wall-E Chess Engine (Strong)"
+        ENGINE_NAME="Wall-E 1.3.2 Strong"
+        EXTRA_CXXFLAGS=(-DWALLE_PHASE_NETS)
+        APK_NAME="wall-e.strong.apk"
+        ;;
+    *) die "unknown VARIANT '$VARIANT' (expected tiny or strong)" ;;
+esac
+APK="$PROJECT/build/$APK_NAME"
 
 [[ -f "$BT/aapt2.exe" ]] || die "aapt2 not found in $BT"
 [[ -f "$PLATFORM" ]] || die "android.jar not found at $PLATFORM"
@@ -49,6 +74,10 @@ die() { echo "error: $*" >&2; exit 1; }
 [[ -f "$PROJECT/chess.cpp" && -f "$PROJECT/nnue.cpp" && -f "$PROJECT/nnue_embedded.cpp" ]] \
     || die "engine sources missing"
 [[ -f "$PROJECT/nnue/fingolfin.nnue" ]] || die "network nnue/fingolfin.nnue missing"
+if [[ "$VARIANT" == "strong" ]]; then
+    [[ -f "$PROJECT/nnue/finarfin.nnue" && -f "$PROJECT/nnue/feanor.nnue" ]] \
+        || die "the strong variant also needs nnue/finarfin.nnue and nnue/feanor.nnue"
+fi
 
 clang_for() {
     local triple="$1"
@@ -60,6 +89,17 @@ clang_for() {
 
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage" "$PROJECT/build"
+
+# The manifest and the engine list differ per variant (application id, label, engine
+# name), so they are generated here instead of being duplicated as source files.
+mkdir -p "$OUT/res/xml"
+sed -e "s|package=\"com.tianl1234.walle\"|package=\"$APP_ID\"|" \
+    -e "s|android:authorities=\"com.tianl1234.walle.EngineProvider\"|android:authorities=\"$APP_ID.EngineProvider\"|" \
+    -e "s|android:value=\"com.tianl1234.walle.EngineProvider\"|android:value=\"$APP_ID.EngineProvider\"|" \
+    -e "s|android:label=\"Wall-E Chess Engine\"|android:label=\"$APP_LABEL\"|" \
+    "$HERE/AndroidManifest.xml" > "$OUT/AndroidManifest.xml"
+sed -e "s|name=\"Wall-E[^\"]*\"|name=\"$ENGINE_NAME\"|" \
+    "$HERE/res/xml/enginelist.xml" > "$OUT/res/xml/enginelist.xml"
 
 echo "== 1/6 native engine (embedded NNUE, PIE, max-page-size 16 KiB)"
 # Compiled from the project root: nnue_embedded.cpp uses .incbin "nnue/fingolfin.nnue",
@@ -73,7 +113,17 @@ for abi in "${ABIS[@]}"; do
     CXX="$(clang_for "$triple")"
     echo "   $abi"
     mkdir -p "$OUT/stage/lib/$abi"
+    # -flto lets the search inline the evaluation across translation units;
+    # -ffunction-sections/-fdata-sections is what makes --gc-sections effective;
+    # -fno-exceptions/-fno-rtti drop code the engine never uses.
+    # -fomit-frame-pointer: the NDK keeps the frame pointer by default on arm64.
+    # The baseline ISA is deliberately left at the default (armv8-a): a -mcpu such
+    # as cortex-a76 would emit LSE/dotprod instructions and crash on older
+    # API 26 devices. Tune per device only if the minimum device is known.
     ( cd "$PROJECT" && "$CXX" -O3 -std=c++20 -DNDEBUG -DWALLE_EMBEDDED_NET \
+            ${EXTRA_CXXFLAGS[@]+"${EXTRA_CXXFLAGS[@]}"} \
+            -flto -fno-exceptions -fno-rtti -fomit-frame-pointer \
+            -ffunction-sections -fdata-sections \
             -fPIE -pie -static-libstdc++ \
             -Wl,--gc-sections -Wl,-z,max-page-size=16384 -s \
             -o "$OUT/stage/lib/$abi/libwalle.so" \
@@ -90,11 +140,11 @@ echo "== 3/6 dex"
 cp "$OUT/dex/classes.dex" "$OUT/stage/"
 
 echo "== 4/6 resources (res/xml/enginelist.xml)"
-"$BT/aapt2.exe" compile --dir "$HERE/res" -o "$OUT/res.zip"
+"$BT/aapt2.exe" compile --dir "$OUT/res" -o "$OUT/res.zip"
 
 echo "== 5/6 package + link"
 "$BT/aapt2.exe" link -o "$OUT/base.apk" -I "$PLATFORM" \
-    --manifest "$HERE/AndroidManifest.xml" \
+    --manifest "$OUT/AndroidManifest.xml" \
     --min-sdk-version "$API" --target-sdk-version "$TARGET_API" \
     "$OUT/res.zip"
 

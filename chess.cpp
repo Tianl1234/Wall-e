@@ -93,7 +93,14 @@ inline int rank_of(int s)  { return s >> 3; }
 U64 PawnAtt[2][64];
 U64 KnightAtt[64], KingAtt[64];
 U64 RookMask[64], BishopMask[64];
-U64 RookTable[64][4096];
+// Rook attacks are packed: each square gets exactly 2^popcount(mask) entries
+// instead of a full 2^12 row, which shrinks the table from 2.0 MB to 800 KB and
+// keeps much more of it inside a phone's L2 cache. RookRow[s] points at that
+// square's slice; the magic index is always below 2^popcount(mask), so slices
+// can sit back to back. 102400 is the exact total for the standard rook masks.
+constexpr int kRookTableEntries = 102400;
+U64 RookTable[kRookTableEntries];
+U64* RookRow[64];
 U64 BishopTable[64][512];
 #if !WALLE_PEXT
 int RookShift[64], BishopShift[64];
@@ -396,22 +403,30 @@ void init_all() {
 
     static const int rook_dirs[4][2]   = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
     static const int bishop_dirs[4][2] = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+    int rookEntries = 0;
     for (int s = 0; s < 64; ++s) {
         RookMask[s]   = pext_mask(s, rook_dirs);
         BishopMask[s] = pext_mask(s, bishop_dirs);
+        const int rn = 1 << popcount(RookMask[s]);
+        RookRow[s] = RookTable + rookEntries;
+        rookEntries += rn;
 #if WALLE_PEXT
-        int rn = 1 << popcount(RookMask[s]);
         for (int i = 0; i < rn; ++i)
-            RookTable[s][i] = slide_attacks(s, _pdep_u64((U64)i, RookMask[s]), rook_dirs);
+            RookRow[s][i] = slide_attacks(s, _pdep_u64((U64)i, RookMask[s]), rook_dirs);
         int bn = 1 << popcount(BishopMask[s]);
         for (int i = 0; i < bn; ++i)
             BishopTable[s][i] = slide_attacks(s, _pdep_u64((U64)i, BishopMask[s]), bishop_dirs);
 #else
         RookShift[s]   = 64 - popcount(RookMask[s]);
         BishopShift[s] = 64 - popcount(BishopMask[s]);
-        fill_magic_table(s, RookMask[s], ROOK_MAGICS[s], RookShift[s], rook_dirs, RookTable[s]);
+        fill_magic_table(s, RookMask[s], ROOK_MAGICS[s], RookShift[s], rook_dirs, RookRow[s]);
         fill_magic_table(s, BishopMask[s], BISHOP_MAGICS[s], BishopShift[s], bishop_dirs, BishopTable[s]);
 #endif
+    }
+    if (rookEntries > kRookTableEntries) {
+        std::cerr << "fatal: rook attack table overflow (" << rookEntries
+                  << " entries), raise kRookTableEntries" << '\n';
+        std::exit(1);
     }
 
     for (int c = 0; c < 2; ++c)
@@ -474,10 +489,10 @@ void init_all() {
 }
 
 #if WALLE_PEXT
-inline U64 rook_att(int s, U64 occ)   { return RookTable[s][_pext_u64(occ, RookMask[s])]; }
+inline U64 rook_att(int s, U64 occ)   { return RookRow[s][_pext_u64(occ, RookMask[s])]; }
 inline U64 bishop_att(int s, U64 occ) { return BishopTable[s][_pext_u64(occ, BishopMask[s])]; }
 #else
-inline U64 rook_att(int s, U64 occ)   { return RookTable[s][((occ & RookMask[s]) * ROOK_MAGICS[s]) >> RookShift[s]]; }
+inline U64 rook_att(int s, U64 occ)   { return RookRow[s][((occ & RookMask[s]) * ROOK_MAGICS[s]) >> RookShift[s]]; }
 inline U64 bishop_att(int s, U64 occ) { return BishopTable[s][((occ & BishopMask[s]) * BISHOP_MAGICS[s]) >> BishopShift[s]]; }
 #endif
 
@@ -1970,6 +1985,22 @@ void apply_go_limits(const GoParams& gp, bool infinite) {
     }
 }
 
+#if defined(WALLE_PHASE_NETS)
+// The "strong" package carries three networks instead of one and picks between them
+// from the tapered-evaluation phase of the root position (0..24 material points,
+// 24 = the untouched opening position). It follows how Patricia splits its nets:
+// a full board is still an opening, a sparse one already an endgame. The choice is
+// made once per search, because a network cannot be swapped while the accumulators
+// of a running search are being updated move by move.
+bool g_phaseNets = true;
+
+int phase_slot(int phaseInc) {
+    if (phaseInc <= 8) return Nnue::ENDGAME_NET;      // finarfin
+    if (phaseInc >= 19) return Nnue::AGGRESSIVE_NET;  // feanor
+    return Nnue::MIDDLEGAME_NET;                      // fingolfin
+}
+#endif
+
 void init_threads(int n, const Position* seed = nullptr) {
     Position keep;
     if (seed) keep = *seed;
@@ -2031,6 +2062,17 @@ int main(int argc, char** argv) {
         if (loaded) evalFile = "<embedded network>";
     }
 #endif
+#if defined(WALLE_EMBEDDED_NET) && defined(WALLE_PHASE_NETS)
+    // The strong package evaluates with three networks. Loading a slot leaves it
+    // active, so the middlegame net has to be selected again afterwards.
+    if (loaded) {
+        const bool endgame = Nnue::load_embedded(Nnue::ENDGAME_NET);
+        const bool aggressive = Nnue::load_embedded(Nnue::AGGRESSIVE_NET);
+        Nnue::select(Nnue::MIDDLEGAME_NET);
+        if (endgame && aggressive) evalFile += " + finarfin + feanor";
+        else std::cerr << "info string NNUE: phase networks unavailable; single-network evaluation\n";
+    }
+#endif
     if (loaded) std::cerr << "info string NNUE loaded: " << evalFile << '\n';
     else std::cerr << "info string NNUE unavailable; using handcrafted evaluation\n";
 
@@ -2073,6 +2115,9 @@ int main(int argc, char** argv) {
                 if (!Nnue::load(evalFile)) std::cerr << "info string NNUE load failed; retaining current evaluator: " << evalFile << '\n';
                 else {
                     std::cerr << "info string NNUE loaded: " << evalFile << '\n';
+#if defined(WALLE_PHASE_NETS)
+                    g_phaseNets = false;  // an explicitly chosen network wins over the per-phase choice
+#endif
                     Nnue::reset(board.nnue, board.sq);
                 }
             }
@@ -2142,6 +2187,13 @@ int main(int argc, char** argv) {
             g_go.stm = board.stm;
             g_go.valid = true;
             apply_go_limits(g_go, infinite);
+
+#if defined(WALLE_PHASE_NETS)
+            // Pick the network for this search before any accumulator is built:
+            // the accumulators of the root and of every thread are rebuilt here.
+            if (g_phaseNets && Nnue::select(phase_slot(board.phaseInc)))
+                Nnue::reset(board.nnue, board.sq);
+#endif
 
             // refresh the working copy of the position for every thread
             for (size_t i = 0; i < threads.size(); ++i) {
