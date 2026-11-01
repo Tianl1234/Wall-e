@@ -42,7 +42,7 @@ copied from working engine APKs rather than invented:
 
 ```xml
 <enginelist>
-    <engine name="Wall-E 1.2" filename="libwalle.so" target="arm64-v8a|x86_64" />
+    <engine name="Wall-E 1.3" filename="libwalle.so" target="arm64-v8a|x86_64" />
 </enginelist>
 ```
 
@@ -71,12 +71,12 @@ plays, but with the weaker handcrafted evaluation.
 1. Install `Wall-E-engine.apk` (it will not appear in the launcher — by design).
 2. In a GUI that supports OEX engines (Chess for Android, Chessis, and other
    kalab-based GUIs), open the engine menu and **import/select an engine**.
-3. Pick **Wall-E 1.2** from the list.
+3. Pick **Wall-E 1.3** from the list.
 
 For Chess for Android specifically: long-press the notation window → *UCI and XBoard* →
-*Import engine* → *Wall-E 1.2*. No SD-card import step is needed.
+*Import engine* → *Wall-E 1.3*. No SD-card import step is needed.
 
-The APK upgrades the previous console build in place (`versionCode 3`, same signing
+The APK upgrades the previous console build in place (versionCode 7, same signing
 key), so the old icon disappears when you install it.
 
 ## Build
@@ -112,19 +112,18 @@ cannot ship.
 
 ## Verification status
 
-Checked on this machine (`build/Wall-E-engine.apk`, 2,253,409 bytes,
-SHA-256 `ed280b7649fbf344b805280ecbaa0477a04f09aeb302d628d1ab95264fdeb098`):
+Build with `android/build_apk.sh` and refresh the results below after a successful build.
 
 | Check | Result |
 |---|---|
 | Launcher entry | none — `aapt2 dump badging` shows no `launchable-activity`, `application: icon=''`; build script enforces it |
-| Manifest | `com.tianl1234.walle`, versionCode 3 / versionName 1.2, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| Manifest | `com.tianl1234.walle`, versionCode 7 / versionName 1.3.2, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
 | OEX wiring | `intent.chess.provider.ENGINE`, `chess.provider.engine.authority`, exported `EngineProvider`, `res/xml/enginelist.xml` present as `xml/enginelist` |
-| Native code | `arm64-v8a`, `x86_64`; both ELF64 `ET_DYN` PIE with entry points, LOAD `Align 0x4000`, only `libc`/`libm`/`libdl` needed, no TEXTREL |
-| Embedded network | network's first 64 bytes found inside both binaries (offsets 73,664 / 71,488); each is 1.58 MB larger than the pre-embedding engine |
-| Signature | `apksigner verify`: v2 and v3 true, `CN=Wall-E` |
-| Loader refactor (host x86-64) | `NNUE loaded: nnue/fingolfin.nnue`, `perft 5` = **4,865,609**, `bench 12` = 912,862 nodes |
-| APK contents | `classes.dex` 3,612 B; `res/xml/enginelist.xml` 352 B; two `libwalle.so`; nothing else except signatures |
+| Native code | verify `arm64-v8a`, `x86_64`, ELF PIE alignment and no TEXTREL after build |
+| Embedded network | verify network presence in both newly built binaries after build |
+| Signature | verify with `apksigner` after build |
+| Loader/update checks | rerun host perft and bench after the v1.3 update before citing measurements |
+| APK contents | verify contents after build |
 
 **Not checked:** the package was never installed or run on an Android device (no ARM
 hardware, no emulator, no adb here). The NEON NNUE kernels and the extraction/exec path

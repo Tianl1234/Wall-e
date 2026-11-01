@@ -487,7 +487,8 @@ inline U64 bishop_att(int s, U64 occ) { return BishopTable[s][((occ & BishopMask
 struct Undo {
     U64 key;
     int mg, eg, phaseInc;
-    uint8_t castling, ep, fifty, captured;
+    int fifty;
+    uint8_t castling, ep, captured;
     uint16_t move;
 };
 
@@ -524,10 +525,10 @@ inline void add_piece(Position& p, int pc, int s) {
 
 inline void remove_piece(Position& p, int pc, int s) {
     U64 b = bit(s);
-    p.bb[pc] ^= b;
-    p.byType[pc_type(pc)] ^= b;
-    p.occ[pc >> 3] ^= b;
-    p.all ^= b;
+    p.bb[pc] &= ~b;
+    p.byType[pc_type(pc)] &= ~b;
+    p.occ[pc >> 3] &= ~b;
+    p.all &= ~b;
     p.sq[s] = EMPTY;
     const int sgn = (pc_color(pc) == WHITE) ? 1 : -1;
     p.mg -= sgn * PSQ_MG[pc][s];
@@ -540,6 +541,18 @@ inline U64 ep_key(const Position& p, int stm, int ep) {
     if (ep < 0) return 0;
     if (PawnAtt[stm ^ 1][ep] & p.bb[make_pc(stm, PAWN)]) return Zep[file_of(ep)];
     return 0;
+}
+
+// Appends the current key to the repetition history. When the buffer is full
+// the older half is dropped, so histSize never exceeds MAX_HISTORY and
+// keyHist[histSize - 1] always holds the current position's key.
+inline void push_key(Position& p) {
+    if (p.histSize >= MAX_HISTORY) {
+        const int keep = MAX_HISTORY / 2;
+        std::memmove(p.keyHist, p.keyHist + (MAX_HISTORY - keep), keep * sizeof(U64));
+        p.histSize = keep;
+    }
+    p.keyHist[p.histSize++] = p.key;
 }
 
 inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) {
@@ -555,7 +568,7 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
     u.key = p.key;
     u.castling = (uint8_t)p.castling;
     u.ep = (uint8_t)(p.ep < 0 ? 64 : p.ep);
-    u.fifty = (uint8_t)p.fifty;
+    u.fifty = p.fifty;
     u.mg = p.mg; u.eg = p.eg; u.phaseInc = p.phaseInc;
     u.move = m;
     u.captured = EMPTY;
@@ -599,8 +612,7 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
     p.key ^= ep_key(p, them, p.ep);
     p.key ^= Zcastle[p.castling];
 
-    if (p.histSize < MAX_HISTORY) p.keyHist[p.histSize] = p.key;
-    p.histSize++;
+    push_key(p);
 }
 
 inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = true) {
@@ -826,46 +838,62 @@ static inline void gen_all(const Position& p, MoveList& ml) {
 // ---------------------------------------------------------------------------
 constexpr int SEE_VAL[7] = {0, 100, 320, 330, 500, 950, 20000};
 
-static int see_rec(const Position& p, int to, int side, int target, U64 occ) {
-    U64 att = attackers_to(p, to, occ) & p.occ[side] & occ;
-    int pt;
-    U64 bb = 0;
-    for (pt = PAWN; pt <= KING; ++pt) {
-        bb = att & p.bb[make_pc(side, pt)];
-        if (bb) break;
-    }
-    if (!bb) return 0;
-    U64 nb = bb & (~bb + 1);
-    U64 occ2 = occ ^ nb;
-    if (pt == KING) {
-        if (attackers_to(p, to, occ2) & p.occ[side ^ 1] & occ2) return 0;
-    }
-    int reply = see_rec(p, to, side ^ 1, SEE_VAL[pt], occ2);
-    return std::max(0, target - reply);
-}
+// Static exchange evaluation with a threshold: does move m win at least
+// `threshold`? Classic swap algorithm: walk the least-valuable-attacker
+// recapture sequence, then evaluate it back-to-front (either side may decline
+// a losing recapture). Two bounds short-circuit most calls immediately:
+// the exchange can never win more than the first victim, and never lose more
+// than the moving piece on top of it.
+bool see_ge(const Position& p, uint16_t m, int threshold) {
+    const int from = mv_from(m), to = mv_to(m), mt = mv_type(m);
+    const int us = p.stm;
 
-int see_value(const Position& p, uint16_t m) {
-    const int mt = mv_type(m);
-    if (!is_capture(mt)) {
-        if (is_promo(mt)) return SEE_VAL[promo_type(mt)] - SEE_VAL[PAWN];
-        return 0;
-    }
-    const int from = mv_from(m), to = mv_to(m);
-    const int us = p.stm, them = us ^ 1;
-    int gain = SEE_VAL[pc_type(mt == MT_EP ? make_pc(them, PAWN) : p.sq[to])];
-    int ourVal = SEE_VAL[pc_type(p.sq[from])];
-    if (is_promo(mt)) {
-        gain += SEE_VAL[promo_type(mt)] - SEE_VAL[PAWN];
-        ourVal = SEE_VAL[promo_type(mt)];
-    }
+    // By convention a non-capturing, non-promoting move has a SEE of zero:
+    // the opponent does not get a free recapture on it.
+    if (!is_capture(mt) && !is_promo(mt)) return threshold <= 0;
+
+    const int c0 = SEE_VAL[(mt == MT_EP) ? PAWN : pc_type(p.sq[to])]
+                 + (is_promo(mt) ? SEE_VAL[promo_type(mt)] - SEE_VAL[PAWN] : 0);
+    if (c0 < threshold) return false;
+
+    const int a0 = is_promo(mt) ? promo_type(mt) : pc_type(p.sq[from]);
+    if (c0 - SEE_VAL[a0] >= threshold) return true;
+
     U64 occ = p.all ^ bit(from);
     if (mt == MT_EP) occ ^= bit(us == WHITE ? to - 8 : to + 8);
-    else occ ^= bit(to);
-    return gain - see_rec(p, to, them, ourVal, occ);
-}
+    else             occ ^= bit(to);
 
-inline bool see_ge(const Position& p, uint16_t m, int threshold) {
-    return see_value(p, m) >= threshold;
+    // vals[k] = piece type of the k-th piece to land on the square:
+    // vals[0] is the mover, vals[1] their cheapest recapturer, ...
+    int vals[32];
+    int n = 1;
+    vals[0] = a0;
+    int side = us ^ 1;
+    while (n < 32) {
+        U64 att = attackers_to(p, to, occ) & occ & p.occ[side];
+        if (!att) break;
+        int pt;
+        U64 b = 0;
+        for (pt = PAWN; pt <= KING; ++pt) {
+            b = att & p.bb[make_pc(side, pt)];
+            if (b) break;
+        }
+        if (pt == KING) {
+            // a king may only recapture into an otherwise undefended square;
+            // if the square stays defended, this side has to stop here
+            U64 occ2 = occ ^ (b & (0 - b));
+            if (attackers_to(p, to, occ2) & occ2 & p.occ[side ^ 1]) break;
+        }
+        vals[n++] = pt;
+        occ ^= b & (0 - b);
+        side ^= 1;
+    }
+
+    // f = value of the remaining recapture sequence for the side to move
+    int f = 0;
+    for (int k = n - 1; k >= 1; --k)
+        f = std::max(0, SEE_VAL[vals[k - 1]] - f);
+    return c0 - f >= threshold;
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,8 +1128,16 @@ struct TT {
         t.assign(p2 * 4, TTEntry{});
         bucketMask = (U64)(p2 - 1);
     }
-    void clear() { std::fill(t.begin(), t.end(), TTEntry{}); }
+    inline void clear() { std::fill(t.begin(), t.end(), TTEntry{}); }
     inline TTEntry* bucket(U64 key) { return &t[(key & bucketMask) * 4]; }
+
+    // Start the cache-line load early: the probe below is the first heavy
+    // memory access of every node once the table outgrows the caches.
+    inline void prefetch(U64 key) {
+#if defined(__GNUC__) || defined(__clang__)
+        if (!t.empty()) __builtin_prefetch(bucket(key), 0, 3);
+#endif
+    }
 
     inline bool probe(U64 key, uint16_t& mv, int& score, int& depth, int& bound) {
         if (t.empty()) return false;
@@ -1115,7 +1151,6 @@ struct TT {
                 return true;
             }
         }
-        mv = b[0].move;
         return false;
     }
 
@@ -1138,7 +1173,9 @@ struct TT {
         slot->key = key;
         slot->value = (int16_t)score;
         slot->move = mv;
-        slot->depth = (int8_t)depth;
+        // depth is stored in a signed byte: `go depth` values above 127 would
+        // wrap around negative and poison every later probe
+        slot->depth = (int8_t)std::min(depth, 126);
         slot->genBound = (uint8_t)((gen << 2) | bound);
     }
 
@@ -1227,8 +1264,10 @@ inline bool check_stop(ThreadData& T) {
 }
 
 inline bool is_repetition(const Position& p) {
-    int end = std::max(0, p.histSize - p.fifty - 1);
-    for (int i = p.histSize - 2; i >= end; i -= 2)
+    // keyHist[histSize - 1] is the current position's own key, so positions
+    // that can repeat it (same side to move) sit at histSize - 3, - 5, ...
+    const int end = std::max(0, p.histSize - p.fifty - 1);
+    for (int i = p.histSize - 3; i >= end; i -= 2)
         if (p.keyHist[i] == p.key) return true;
     return false;
 }
@@ -1242,8 +1281,7 @@ inline void make_null(Position& p, NullUndo& nu) {
     p.stm ^= 1;
     p.key ^= Zside;
     p.fifty++;
-    if (p.histSize < MAX_HISTORY) p.keyHist[p.histSize] = p.key;
-    p.histSize++;
+    push_key(p);
 }
 
 inline void unmake_null(Position& p, const NullUndo& nu) {
@@ -1341,6 +1379,8 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
     if ((T.nodes & 1023) == 0 && check_stop(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
     if (ply >= MAX_PLY - 2) return evaluate(pos);
+
+    tt.prefetch(pos.key);
 
     const bool chk = in_check(pos);
     if (chk) depth++;
@@ -1571,7 +1611,7 @@ std::string move_str(const Position&, uint16_t m) {
     s += char('a' + file_of(mv_to(m)));
     s += char('1' + rank_of(mv_to(m)));
     if (is_promo(mv_type(m))) {
-        const char pc[] = {' ', 'n', 'b', 'r', 'q'};
+        const char pc[] = {' ', ' ', 'n', 'b', 'r', 'q'};
         s += pc[promo_type(mv_type(m))];
     }
     return s;
@@ -1619,7 +1659,7 @@ struct RootMove {
     int score;
 };
 
-void iterate(ThreadData& T, int maxDepth, bool mainThread) {
+void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
     Position& pos = T.pos;
 
     MoveList ml;
@@ -1642,13 +1682,13 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread) {
     int delta = 16;
     T.nodes = 0;          // cumulative for this iterate() call
 
-    for (int d = 1; d <= maxDepth; ++d) {
+    for (int d = startDepth; d <= maxDepth; ++d) {
         if (mainThread && d > 1 && g_lim.soft > 0 && elapsed_ms() >= g_lim.soft) break;
 
         T.seldepth = 0;
 
         int alpha, beta;
-        if (d == 1) { alpha = -INF; beta = INF; }
+        if (d == startDepth) { alpha = -INF; beta = INF; }
         else {
             alpha = std::max(-INF, prevScore - delta);
             beta  = std::min(INF, prevScore + delta);
@@ -1720,11 +1760,10 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread) {
 }
 
 void helper_main(ThreadData* T, int maxDepth) {
-    int phase = T->id & 1;
-    for (int d = 1; d <= maxDepth; ++d) {
-        if (g_stop.load(std::memory_order_relaxed)) break;
-        iterate(*T, std::min(maxDepth, d + phase), false);
-    }
+    // Run the same iterative-deepening loop as the main thread, so the helpers
+    // keep their aspiration windows and root ordering across depths. The shared
+    // TT plus the per-thread history/killer tables keep the threads diverse.
+    iterate(*T, maxDepth, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,6 +1831,15 @@ bool set_fen(Position& p, const std::string& fen) {
             default: break;
         }
     }
+    // Drop any right the placement does not actually support: otherwise a
+    // malformed FEN would let gen_all emit a castling move whose rook does not
+    // exist, and executing it would corrupt the bitboards.
+    if (!(p.bb[W_K] & bit(4)))  p.castling &= ~3;
+    if (!(p.bb[B_K] & bit(60))) p.castling &= ~12;
+    if (!(p.bb[W_R] & bit(7)))  p.castling &= ~1;
+    if (!(p.bb[W_R] & bit(0)))  p.castling &= ~2;
+    if (!(p.bb[B_R] & bit(63))) p.castling &= ~4;
+    if (!(p.bb[B_R] & bit(56))) p.castling &= ~8;
     if (ep != "-" && ep.size() >= 2)
         p.ep = (ep[1] - '1') * 8 + (ep[0] - 'a');
 
@@ -2016,7 +2064,7 @@ int main(int argc, char** argv) {
             while (iss >> w && w != "value") { if (!name.empty()) name += ' '; name += w; }
             std::getline(iss, val);
             if (!val.empty() && val[0] == ' ') val.erase(0, 1);
-            if (name == "Hash") { g_hashMB = std::atoi(val.c_str()); tt.resize(g_hashMB); }
+            if (name == "Hash") { stop_search(); g_hashMB = std::atoi(val.c_str()); tt.resize(g_hashMB); }
             else if (name == "Threads") { g_threadCount = std::max(1, std::atoi(val.c_str())); }
             else if (name == "Move Overhead") { g_moveOverhead = std::max(0, std::atoi(val.c_str())); }
             else if (name == "EvalFile") {

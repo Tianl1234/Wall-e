@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #elif defined(__ARM_NEON) || defined(__aarch64__)
@@ -30,6 +31,8 @@ struct alignas(64) Network {
 };
 std::unique_ptr<Network> network;
 
+bool network_sane();
+
 // Only the Android package defines WALLE_EMBEDDED_NET. The network is appended to
 // the engine binary there (see nnue_embedded.cpp) because a GUI executes the engine
 // out of the APK's lib directory, where there is no working directory to hold
@@ -54,7 +57,25 @@ bool load_network_memory(const void* data, std::size_t size) {
     std::copy_n(raw.data() + offset, HIDDEN_SIZE * 2, &candidate->outputWeights[0][0]);
     offset += HIDDEN_SIZE * 2;
     candidate->outputBias = raw[offset];
+
+    // The SIMD inference path multiplies clipped activations (0..255) by signed
+    // weights in 16-bit lanes before widening, so the products must stay inside
+    // int16_t.
+    for (const auto& perspective : candidate->outputWeights)
+        for (int16_t weight : perspective)
+            if (weight < -128 || weight > 128) return false;
+
     network = std::move(candidate);
+    // A network whose material ordering is nonsense, or that does not match this
+    // code's feature layout, would silently ruin every evaluation and make a
+    // GUI's evaluation bar meaningless (it moves the wrong way, or jumps around
+    // for equal positions). Reject it so the caller keeps the handcrafted
+    // evaluation instead of a broken one.
+    if (!network_sane()) {
+        network.reset();
+        std::cerr << "info string NNUE: network fails material sanity checks; rejected\n";
+        return false;
+    }
     return true;
 }
 
@@ -74,29 +95,32 @@ inline int feature_index(int piece, int square, int perspective) {
     return ((color ^ perspective) * 6 + type - 1) * 64 + orientedSquare;
 }
 
-void add_row(int16_t* dst, const int16_t* row) {
+void update_row(int16_t* dst, const int16_t* row, bool add) {
 #if defined(__AVX512BW__) && defined(__AVX512F__)
     for (int i = 0; i < HIDDEN_SIZE; i += 32) {
         __m512i value = _mm512_load_si512(reinterpret_cast<const __m512i*>(dst + i));
         const __m512i weights = _mm512_load_si512(reinterpret_cast<const __m512i*>(row + i));
-        _mm512_store_si512(reinterpret_cast<__m512i*>(dst + i), _mm512_adds_epi16(value, weights));
+        value = add ? _mm512_adds_epi16(value, weights) : _mm512_subs_epi16(value, weights);
+        _mm512_store_si512(reinterpret_cast<__m512i*>(dst + i), value);
     }
 #elif defined(__AVX2__)
     for (int i = 0; i < HIDDEN_SIZE; i += 16) {
         __m256i value = _mm256_load_si256(reinterpret_cast<const __m256i*>(dst + i));
         const __m256i weights = _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_adds_epi16(value, weights));
+        value = add ? _mm256_adds_epi16(value, weights) : _mm256_subs_epi16(value, weights);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), value);
     }
 #elif defined(WALLE_NEON)
     for (int i = 0; i < HIDDEN_SIZE; i += 8) {
         const int16x8_t value = vld1q_s16(dst + i);
         const int16x8_t weights = vld1q_s16(row + i);
-        vst1q_s16(dst + i, vqaddq_s16(value, weights));
+        vst1q_s16(dst + i, add ? vqaddq_s16(value, weights) : vqsubq_s16(value, weights));
     }
 #else
+    const int sign = add ? 1 : -1;
     for (int i = 0; i < HIDDEN_SIZE; ++i)
         dst[i] = static_cast<int16_t>(std::clamp(
-            static_cast<int>(dst[i]) + row[i], -32768, 32767));
+            static_cast<int>(dst[i]) + sign * row[i], -32768, 32767));
 #endif
 }
 
@@ -142,21 +166,29 @@ int infer(const Accumulator& acc, int stm) {
 #elif defined(WALLE_NEON)
     // Mirrors the x86 path: the products are taken in wrapping int16, then
     // accumulated into 32-bit lanes. Same arithmetic, same rounding.
-    int32x4_t sum = vdupq_n_s32(0);
+    // Two accumulators halve the per-lane product count, keeping the 32-bit
+    // lanes overflow-safe (256 products x 255 x 255 x 128 < 2^31), the same
+    // bound the AVX2 path naturally has.
+    int32x4_t sum0 = vdupq_n_s32(0), sum1 = vdupq_n_s32(0);
     const int16x8_t zero = vdupq_n_s16(0);
     const int16x8_t maxValue = vdupq_n_s16((int16_t)QA);
-    for (int i = 0; i < HIDDEN_SIZE; i += 8) {
-        const int16x8_t a = vminq_s16(vmaxq_s16(vld1q_s16(us + i), zero), maxValue);
-        const int16x8_t b = vminq_s16(vmaxq_s16(vld1q_s16(them + i), zero), maxValue);
-        const int16x8_t wa = vld1q_s16(network->outputWeights[0] + i);
-        const int16x8_t wb = vld1q_s16(network->outputWeights[1] + i);
-        const int16x8_t pa = vmulq_s16(a, wa);
-        const int16x8_t pb = vmulq_s16(b, wb);
-        sum = vmlal_s16(sum, vget_low_s16(pa), vget_low_s16(a));
-        sum = vmlal_s16(sum, vget_high_s16(pa), vget_high_s16(a));
-        sum = vmlal_s16(sum, vget_low_s16(pb), vget_low_s16(b));
-        sum = vmlal_s16(sum, vget_high_s16(pb), vget_high_s16(b));
+    for (int i = 0; i < HIDDEN_SIZE; i += 16) {
+        for (int j = 0; j < 2; ++j) {
+            const int k = i + 8 * j;
+            const int16x8_t a = vminq_s16(vmaxq_s16(vld1q_s16(us + k), zero), maxValue);
+            const int16x8_t b = vminq_s16(vmaxq_s16(vld1q_s16(them + k), zero), maxValue);
+            const int16x8_t wa = vld1q_s16(network->outputWeights[0] + k);
+            const int16x8_t wb = vld1q_s16(network->outputWeights[1] + k);
+            const int16x8_t pa = vmulq_s16(a, wa);
+            const int16x8_t pb = vmulq_s16(b, wb);
+            int32x4_t& s = j ? sum1 : sum0;
+            s = vmlal_s16(s, vget_low_s16(pa), vget_low_s16(a));
+            s = vmlal_s16(s, vget_high_s16(pa), vget_high_s16(a));
+            s = vmlal_s16(s, vget_low_s16(pb), vget_low_s16(b));
+            s = vmlal_s16(s, vget_high_s16(pb), vget_high_s16(b));
+        }
     }
+    const int32x4_t sum = vaddq_s32(sum0, sum1);
 #if defined(__aarch64__)
     total += vaddvq_s32(sum);
 #else
@@ -175,6 +207,43 @@ int infer(const Accumulator& acc, int stm) {
     return static_cast<int>((total * SCALE) /
                             (static_cast<int64_t>(QA) * QA * 64));
 }
+
+// Sanity probe on realistic positions. The old check used bare-kings positions
+// with a single piece on d4, which are far outside this network's training
+// distribution: it genuinely rates a lone bishop below a pawn there, so the old
+// monotone-material test rejected a perfectly good net and silently disabled
+// NNUE. Probe the start position instead: it must be near equal, must evaluate
+// identically from either side to move (it is mirror symmetric, so a
+// perspective mix-up breaks this), and removing a knight from either side must
+// swing the evaluation by roughly a knight's value.
+bool network_sane() {
+    if (!network) return false;
+
+    uint8_t board[64] = {};
+    const uint8_t backRank[8] = {4, 2, 3, 5, 6, 3, 2, 4};
+    for (int file = 0; file < 8; ++file) {
+        board[file] = backRank[file];
+        board[8 + file] = 1;   // white pawns
+        board[48 + file] = 9;  // black pawns
+        board[56 + file] = static_cast<uint8_t>(backRank[file] + 8);
+    }
+
+    Accumulator acc{};
+    reset(acc, board);
+    const int start = infer(acc, 0);
+    if (start < -300 || start > 300) return false;
+    if (infer(acc, 1) != start) return false;
+
+    board[57] = 0;  // remove black's b8 knight
+    reset(acc, board);
+    if (infer(acc, 0) - start < 300) return false;
+
+    board[57] = 10;  // restore black's b8 knight
+    board[6] = 0;   // remove white's g1 knight
+    reset(acc, board);
+    if (infer(acc, 0) - start > -200) return false;
+    return true;
+}
 } // namespace
 
 bool load(const std::string& networkPath) { return load_network(networkPath); }
@@ -192,63 +261,14 @@ bool available() { return static_cast<bool>(network); }
 
 void apply_changes(Accumulator& acc, const PieceChange* changes, int count) {
     if (!network || count <= 0) return;
-    alignas(64) int32_t delta[2][HIDDEN_SIZE]{};
     for (int change = 0; change < count; ++change) {
         const PieceChange& piece = changes[change];
         if (piece.type < 1 || piece.type > 6 || piece.square < 0 || piece.square >= 64) continue;
         const int pc = (piece.color << 3) | piece.type;
-        const int sign = piece.add ? 1 : -1;
         for (int perspective = 0; perspective < 2; ++perspective) {
             const int index = feature_index(pc, piece.square, perspective);
-            const int16_t* weights = network->featureWeights[index];
-            int32_t* changesForSide = delta[perspective];
-#if defined(__AVX512BW__) && defined(__AVX512F__)
-            for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-                const __m256i packed = _mm256_load_si256(reinterpret_cast<const __m256i*>(weights + i));
-                const __m512i expanded = _mm512_cvtepi16_epi32(packed);
-                const __m512i signedWeights = _mm512_mullo_epi32(expanded, _mm512_set1_epi32(sign));
-                __m512i old = _mm512_load_si512(reinterpret_cast<const __m512i*>(changesForSide + i));
-                _mm512_store_si512(reinterpret_cast<__m512i*>(changesForSide + i), _mm512_add_epi32(old, signedWeights));
-            }
-#elif defined(WALLE_NEON)
-            for (int i = 0; i < HIDDEN_SIZE; i += 8) {
-                const int16x8_t packed = vld1q_s16(weights + i);
-                int32x4_t lo = vmovl_s16(vget_low_s16(packed));
-                int32x4_t hi = vmovl_s16(vget_high_s16(packed));
-                if (sign < 0) { lo = vnegq_s32(lo); hi = vnegq_s32(hi); }
-                vst1q_s32(changesForSide + i, vaddq_s32(vld1q_s32(changesForSide + i), lo));
-                vst1q_s32(changesForSide + i + 4, vaddq_s32(vld1q_s32(changesForSide + i + 4), hi));
-            }
-#else
-            for (int i = 0; i < HIDDEN_SIZE; ++i) changesForSide[i] += sign * weights[i];
-#endif
+            update_row(acc.values[perspective], network->featureWeights[index], piece.add);
         }
-    }
-
-    for (int perspective = 0; perspective < 2; ++perspective) {
-        int16_t* dst = acc.values[perspective];
-#if defined(__AVX512BW__) && defined(__AVX512F__)
-        const __m512i minValue = _mm512_set1_epi32(-32768);
-        const __m512i maxValue = _mm512_set1_epi32(32767);
-        for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-            const __m256i old16 = _mm256_load_si256(reinterpret_cast<const __m256i*>(dst + i));
-            const __m512i old32 = _mm512_cvtepi16_epi32(old16);
-            const __m512i change = _mm512_load_si512(reinterpret_cast<const __m512i*>(delta[perspective] + i));
-            const __m512i result = _mm512_min_epi32(_mm512_max_epi32(_mm512_add_epi32(old32, change), minValue), maxValue);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), _mm512_cvtsepi32_epi16(result));
-        }
-#elif defined(WALLE_NEON)
-        for (int i = 0; i < HIDDEN_SIZE; i += 8) {
-            const int16x8_t old16 = vld1q_s16(dst + i);
-            const int32x4_t low = vaddq_s32(vmovl_s16(vget_low_s16(old16)), vld1q_s32(delta[perspective] + i));
-            const int32x4_t high = vaddq_s32(vmovl_s16(vget_high_s16(old16)), vld1q_s32(delta[perspective] + i + 4));
-            vst1q_s16(dst + i, vcombine_s16(vqmovn_s32(low), vqmovn_s32(high)));   // saturating narrow == clamp
-        }
-#else
-        for (int i = 0; i < HIDDEN_SIZE; ++i)
-            dst[i] = static_cast<int16_t>(std::clamp(
-                static_cast<int32_t>(dst[i]) + delta[perspective][i], -32768, 32767));
-#endif
     }
 }
 
@@ -261,7 +281,7 @@ void reset(Accumulator& acc, const uint8_t board[64]) {
             const int piece = board[square];
             if (!piece) continue;
             const int index = feature_index(piece, square, perspective);
-            add_row(dst, network->featureWeights[index]);
+            update_row(dst, network->featureWeights[index], true);
         }
     }
 }
