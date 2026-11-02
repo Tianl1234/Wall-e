@@ -68,15 +68,17 @@ plays, but with the weaker handcrafted evaluation.
 
 ## Using it
 
-1. Install `Wall-E-engine.apk` (it will not appear in the launcher — by design).
+1. Install `Wall-E-engine-1.3.3.apk` (it will not appear in the launcher — by design).
+   `Wall-E-engine-1.3.3-strong.apk` is the three-network variant; install it too if you
+   want to compare, or instead of the default package.
 2. In a GUI that supports OEX engines (Chess for Android, Chessis, and other
    kalab-based GUIs), open the engine menu and **import/select an engine**.
-3. Pick **Wall-E 1.3** from the list.
+3. Pick **Wall-E 1.3.3** (or **Wall-E 1.3.3 (Strong)**) from the list.
 
 For Chess for Android specifically: long-press the notation window → *UCI and XBoard* →
-*Import engine* → *Wall-E 1.3*. No SD-card import step is needed.
+*Import engine* → *Wall-E 1.3.3*. No SD-card import step is needed.
 
-The APK upgrades the previous console build in place (versionCode 7, same signing
+The APK upgrades the previous console build in place (versionCode 8, same signing
 key), so the old icon disappears when you install it.
 
 ## Build
@@ -87,8 +89,8 @@ Requirements: JDK 17+, Android SDK with `platforms;android-34`,
 
 ```sh
 cd android
-bash build_apk.sh
-# -> ../build/Wall-E-engine.apk  (arm64-v8a + x86_64)
+VARIANT=tiny   bash build_apk.sh   # -> ../build/wall-e.tiny.apk
+VARIANT=strong bash build_apk.sh   # -> ../build/wall-e.strong.apk
 ```
 
 Toolchain paths can be overridden with `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`,
@@ -117,7 +119,7 @@ Build with `android/build_apk.sh` and refresh the results below after a successf
 | Check | Result |
 |---|---|
 | Launcher entry | none — `aapt2 dump badging` shows no `launchable-activity`, `application: icon=''`; build script enforces it |
-| Manifest | `com.tianl1234.walle`, versionCode 7 / versionName 1.3.2, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| Manifest | `com.tianl1234.walle` / `com.tianl1234.walle.strong`, versionCode 8 / versionName 1.3.3, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
 | OEX wiring | `intent.chess.provider.ENGINE`, `chess.provider.engine.authority`, exported `EngineProvider`, `res/xml/enginelist.xml` present as `xml/enginelist` |
 | Native code | verify `arm64-v8a`, `x86_64`, ELF PIE alignment and no TEXTREL after build |
 | Embedded network | verify network presence in both newly built binaries after build |

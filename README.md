@@ -26,13 +26,54 @@ build/                 local build output (host test binaries, APK staging)
 
 ```sh
 cd android
-bash build_apk.sh
-# -> ../build/Wall-E-engine.apk  (arm64-v8a + x86_64, network embedded)
+VARIANT=tiny   bash build_apk.sh   # -> ../build/wall-e.tiny.apk
+VARIANT=strong bash build_apk.sh   # -> ../build/wall-e.strong.apk
 ```
+
+Both packages contain arm64-v8a and x86_64 code with the network embedded. `tiny`
+carries fingolfin only; `strong` adds the finarfin and feanor phase networks. They
+use different application ids, so they install side by side.
 
 Requires JDK 17+ and an Android SDK with `platforms;android-34`,
 `build-tools;36.1.0` (D8 in 34.0.0 crashes on modern javac output) and
 `ndk;27.3.13750724`. No Gradle.
+
+## Version 1.3.3 — AVX2 NNUE for x86_64
+
+The Android x86_64 package is compiled against the SSE4.2 baseline, so the
+compile-time AVX2 branches in `nnue.cpp` were skipped and its NNUE kernels fell
+back to scalar loops. On x86 Android devices (Chromebooks, emulators, WSA) that
+made evaluation several times slower than necessary.
+
+`nnue.cpp` now also provides AVX2 clones of the three hot kernels (accumulator
+row update, two-perspective row update, output-layer inference) as
+`__attribute__((target("avx2")))` functions, selected at runtime with
+`__builtin_cpu_supports("avx2")`. The dispatcher is only compiled when the
+baseline lacks AVX2, so native AVX2/AVX-512 desktop builds keep their existing
+paths. The arm64 NEON path is unchanged.
+
+`bench 12` (722,767 nodes), same sources compiled natively:
+
+| build | time |
+|---|---|
+| scalar fallback | 4766 ms |
+| x86-64 baseline + runtime dispatch | 383 ms |
+| `-mavx2` compile-time | 380 ms |
+
+All three produce identical static evaluations on the probe set and an identical
+depth-15 search trace and best move, because the AVX2 kernels use the same
+saturating int16 arithmetic. The old 1.3.2 x86_64 library contained no AVX2
+instructions; the 1.3.3 library contains the kernels and the guarded dispatch.
+
+Two packages are attached to the release:
+
+- `Wall-E-engine-1.3.3.apk` — `com.tianl1234.walle`, one network (fingolfin), ~2.2 MB.
+- `Wall-E-engine-1.3.3-strong.apk` — `com.tianl1234.walle.strong`, three phase
+  networks (fingolfin/finarfin/feanor), ~5.9 MB.
+
+Both are versionCode 8 / versionName 1.3.3, signed with the same key as earlier
+releases and upgrade in place. The change does not affect ARM phones: they
+already ran the NEON kernels.
 
 ## Version 1.3.2 — NNUE actually enabled
 
@@ -94,16 +135,21 @@ could not compile for a phone. These changes fixed that without touching the sea
 - Cross-compiled engines: AArch64 and x86-64 ELF `ET_DYN` PIE, entry points set,
   LOAD alignment 16 KiB, no text relocations, only `libc`/`libm`/`libdl` needed;
   the network's bytes are present inside both binaries.
-- APK: `com.tianl1234.walle`, versionCode 7 / versionName 1.3.2, minSdk 26, targetSdk 34,
-  `extractNativeLibs=true`, native code `arm64-v8a` + `x86_64`, **no launcher category**
-  (so no icon), OEX activity/provider/enginelist present, signature verifies (v2 + v3).
+- APKs: `com.tianl1234.walle` and `com.tianl1234.walle.strong`, versionCode 8 /
+  versionName 1.3.3, minSdk 26, targetSdk 34, `extractNativeLibs=true`, native code
+  `arm64-v8a` + `x86_64`, **no launcher category** (so no icon), OEX
+  activity/provider/enginelist present, signature verifies (v2 + v3).
+- 1.3.3 x86_64 libraries: `.text` section is identical to a locally rebuilt
+  unstripped library, contain the AVX2 kernels and the `have_avx2()` dispatch, and
+  embed the networks byte-for-byte (one in `tiny`, three in `strong`).
 
 Build the current APK with `android/build_apk.sh`; rerun native and package checks after
 changes before quoting updated performance or APK checksum results.
 
 ## Known limitation
 
-There is no ARM device, emulator or `adb` on this machine, so the package could not be
+There is no ARM device or emulator on this machine, so the ARM package could not be
 installed or launched here. The NEON kernels and the extraction/exec path are
-compile- and structure-verified only. On the phone, the first meaningful test is
-`perft 5` from the GUI, which must return 4,865,609.
+compile- and structure-verified only. The x86_64 kernels were additionally executed
+natively at the same baseline (see the 1.3.3 table). On a phone, the first meaningful
+test is `perft 5` from the GUI, which must return 4,865,609.
