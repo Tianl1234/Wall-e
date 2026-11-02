@@ -1,13 +1,22 @@
-// Embeds the NNUE network into the executable's read-only data so the engine
+// Embeds the NNUE networks into the executable's read-only data so the engine
 // ships as a single self-contained file (no separate nnue/ folder to ship).
 //
-// The payload is pulled in at assembly time from NNUE_EMBEDDED_FILE, which is
-// relative to the directory the build is run from (build.sh cd's to the
-// project root for this reason).
+// The payloads are pulled in at assembly time from paths relative to the
+// directory the build is run from (build.sh cd's to the project root for this
+// reason). Slot 0 (fingolfin) is always embedded; the endgame (finarfin) and
+// aggressive (feanor) networks let the engine pick an evaluator per search.
 #include <cstddef>
+
+#include "nnue.h"
 
 #ifndef NNUE_EMBEDDED_FILE
 #define NNUE_EMBEDDED_FILE "nnue/fingolfin.nnue"
+#endif
+#ifndef NNUE_EMBEDDED_ENDGAME_FILE
+#define NNUE_EMBEDDED_ENDGAME_FILE "nnue/finarfin.nnue"
+#endif
+#ifndef NNUE_EMBEDDED_AGGRESSIVE_FILE
+#define NNUE_EMBEDDED_AGGRESSIVE_FILE "nnue/feanor.nnue"
 #endif
 
 // NOTE: the trailing ".text" is required. This is file-scope asm, so without
@@ -21,14 +30,42 @@ __asm__(
     "kEmbeddedNet:\n"
     ".incbin \"" NNUE_EMBEDDED_FILE "\"\n"
     "kEmbeddedNetEnd:\n"
+    ".globl kEmbeddedEndgame\n"
+    ".globl kEmbeddedEndgameEnd\n"
+    ".balign 64\n"
+    "kEmbeddedEndgame:\n"
+    ".incbin \"" NNUE_EMBEDDED_ENDGAME_FILE "\"\n"
+    "kEmbeddedEndgameEnd:\n"
+    ".globl kEmbeddedAggressive\n"
+    ".globl kEmbeddedAggressiveEnd\n"
+    ".balign 64\n"
+    "kEmbeddedAggressive:\n"
+    ".incbin \"" NNUE_EMBEDDED_AGGRESSIVE_FILE "\"\n"
+    "kEmbeddedAggressiveEnd:\n"
     ".text\n");
 
 extern "C" const unsigned char kEmbeddedNet[];
 extern "C" const unsigned char kEmbeddedNetEnd[];
+extern "C" const unsigned char kEmbeddedEndgame[];
+extern "C" const unsigned char kEmbeddedEndgameEnd[];
+extern "C" const unsigned char kEmbeddedAggressive[];
+extern "C" const unsigned char kEmbeddedAggressiveEnd[];
 
 namespace Nnue {
-const unsigned char* embedded_network(std::size_t& size) {
-    size = static_cast<std::size_t>(kEmbeddedNetEnd - kEmbeddedNet);
-    return kEmbeddedNet;
+const unsigned char* embedded_network(int slot, std::size_t& size) {
+    switch (slot) {
+        case MIDDLEGAME_NET:
+            size = static_cast<std::size_t>(kEmbeddedNetEnd - kEmbeddedNet);
+            return kEmbeddedNet;
+        case ENDGAME_NET:
+            size = static_cast<std::size_t>(kEmbeddedEndgameEnd - kEmbeddedEndgame);
+            return kEmbeddedEndgame;
+        case AGGRESSIVE_NET:
+            size = static_cast<std::size_t>(kEmbeddedAggressiveEnd - kEmbeddedAggressive);
+            return kEmbeddedAggressive;
+        default:
+            size = 0;
+            return nullptr;
+    }
 }
 } // namespace Nnue

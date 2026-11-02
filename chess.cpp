@@ -394,6 +394,41 @@ struct Undo {
     uint16_t move;
 };
 
+// One NNUE accumulator per ply, computed lazily. make_move only records the
+// pending feature delta; the accumulator is materialized the first time the
+// position is actually evaluated, which skips the work entirely at nodes that
+// return from the TT or from a pruning rule before evaluation. unmake just
+// pops. Patricia (MIT) uses the same layout; its networks are bundled here.
+struct NnueStack {
+    static constexpr int NO_EVAL = -1000000;
+    Nnue::Accumulator slots[MAX_PLY + 2];
+    Nnue::Update pending[MAX_PLY + 2];
+    bool dirty[MAX_PLY + 2] = {};
+    int eval[MAX_PLY + 2];
+    int8_t evalColor[MAX_PLY + 2];
+    int ply = 0;
+    void reset(const Nnue::Accumulator& root) {
+        ply = 0;
+        slots[0] = root;
+        dirty[0] = false;
+        eval[0] = NO_EVAL;
+    }
+};
+
+// Bring slots[ply] up to date by replaying the pending deltas from the nearest
+// materialized ancestor. The chain is usually one deep; deeper only when a
+// node was never evaluated (check nodes), and the rows of the next update are
+// prefetched while the current one is applied.
+inline void materialize(NnueStack& s) {
+    int base = s.ply;
+    while (base > 0 && s.dirty[base]) --base;
+    for (int i = base + 1; i <= s.ply; ++i) {
+        if (i + 1 <= s.ply) Nnue::prefetch_update(s.pending[i + 1]);
+        Nnue::apply_update(s.slots[i], s.slots[i - 1], s.pending[i]);
+        s.dirty[i] = false;
+    }
+}
+
 struct Position {
     U64 bb[16];
     U64 byType[7];
@@ -457,14 +492,15 @@ inline void push_key(Position& p) {
     p.keyHist[p.histSize++] = p.key;
 }
 
-inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) {
+inline void make_move_core(Position& p, uint16_t m, Undo& u, bool updateNnue, NnueStack* stack) {
     const int from = mv_from(m), to = mv_to(m), mt = mv_type(m);
     const int us = p.stm, them = us ^ 1;
     const int pc = p.sq[from];
-    Nnue::PieceChange nnueChanges[4];
-    int nnueChangeCount = 0;
+    Nnue::Update nnueUpdate;
     auto recordNnue = [&](int piece, int square, bool add) {
-        if (updateNnue) nnueChanges[nnueChangeCount++] = {pc_color(piece), pc_type(piece), square, add};
+        if (!updateNnue) return;
+        if (add) nnueUpdate.addPiece(pc_color(piece), pc_type(piece), square);
+        else     nnueUpdate.subPiece(pc_color(piece), pc_type(piece), square);
     };
 
     u.key = p.key;
@@ -505,7 +541,17 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
         add_piece(p, rook, rt);
     }
 
-    if (updateNnue) Nnue::apply_changes(p.nnue, nnueChanges, nnueChangeCount);
+    if (updateNnue) {
+        if (stack) {
+            const int child = stack->ply + 1;
+            stack->pending[child] = nnueUpdate;
+            stack->dirty[child] = true;
+            stack->eval[child] = NnueStack::NO_EVAL;
+            ++stack->ply;
+        } else {
+            Nnue::apply_update(p.nnue, p.nnue, nnueUpdate);
+        }
+    }
     p.fifty = (captured != EMPTY || pc_type(pc) == PAWN) ? 0 : p.fifty + 1;
     p.ep = (mt == MT_DOUBLE) ? ((from + to) >> 1) : -1;
     p.castling &= (int)(CastleMask[from] & CastleMask[to]);
@@ -517,17 +563,29 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
     push_key(p);
 }
 
-inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = true) {
+// Search moves: the accumulator is derived from the previous ply and kept on
+// the stack. Other callers (perft, verify, UCI position setup) update the
+// Position's own accumulator in place, as before.
+inline void make_move(Position& p, uint16_t m, Undo& u, NnueStack& stack) {
+    make_move_core(p, m, u, true, &stack);
+}
+
+inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) {
+    make_move_core(p, m, u, updateNnue, nullptr);
+}
+
+inline void unmake_core(Position& p, const Undo& u, int movedPc, bool updateNnue, NnueStack* stack) {
     const uint16_t m = u.move;
     const int from = mv_from(m), to = mv_to(m), mt = mv_type(m);
     const int us = p.stm ^ 1;
 
     p.histSize--;
 
-    Nnue::PieceChange nnueChanges[4];
-    int nnueChangeCount = 0;
+    Nnue::Update nnueUpdate;
     auto recordNnue = [&](int piece, int square, bool add) {
-        if (updateNnue) nnueChanges[nnueChangeCount++] = {pc_color(piece), pc_type(piece), square, add};
+        if (!updateNnue) return;
+        if (add) nnueUpdate.addPiece(pc_color(piece), pc_type(piece), square);
+        else     nnueUpdate.subPiece(pc_color(piece), pc_type(piece), square);
     };
     if (is_promo(mt)) {
         recordNnue(make_pc(us, promo_type(mt)), to, false);
@@ -561,7 +619,11 @@ inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = tr
         add_piece(p, u.captured, capsq);
     }
 
-    if (updateNnue) Nnue::apply_changes(p.nnue, nnueChanges, nnueChangeCount);
+    if (stack) --stack->ply;
+    // Outside the search the position carries the child's accumulator, and the
+    // update recorded above already describes the child -> parent delta, so
+    // applying it (rather than subtracting it again) restores the parent.
+    else if (updateNnue) Nnue::apply_update(p.nnue, p.nnue, nnueUpdate);
     // scalars last: the add/remove calls above touched key/mg/eg/phaseInc
     p.stm = us;
     p.key = u.key;
@@ -571,6 +633,14 @@ inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = tr
     p.castling = u.castling;
     p.ep = (u.ep == 64) ? -1 : (int)u.ep;
     p.fifty = u.fifty;
+}
+
+inline void unmake(Position& p, const Undo& u, int movedPc, NnueStack& stack) {
+    unmake_core(p, u, movedPc, true, &stack);
+}
+
+inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = true) {
+    unmake_core(p, u, movedPc, updateNnue, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1067,17 @@ int evaluate_classical(const Position& p) {
     return (p.stm == WHITE) ? v : -v;
 }
 
+inline int evaluate(const Position& p, NnueStack& s) {
+    if (!Nnue::available()) return evaluate_classical(p);
+    const int slot = s.ply;
+    if (s.eval[slot] != NnueStack::NO_EVAL && s.evalColor[slot] == p.stm) return s.eval[slot];
+    materialize(s);
+    const int v = Nnue::evaluate(s.slots[slot], p.stm);
+    s.eval[slot] = v;
+    s.evalColor[slot] = (int8_t)p.stm;
+    return v;
+}
+
 inline int evaluate(const Position& p) {
     return Nnue::available() ? Nnue::evaluate(p.nnue, p.stm) : evaluate_classical(p);
 }
@@ -1152,6 +1233,7 @@ struct ThreadData {
     std::vector<int16_t> contHist;
     uint16_t moveStack[MAX_PLY + 2];
     int evalStack[MAX_PLY + 2];
+    NnueStack nnueStack;
     U64 nodes = 0;
     int seldepth = 0;
     int id = 0;
@@ -1245,16 +1327,29 @@ inline void unmake_null(ThreadData& T, Position& p, const NullUndo& nu, int ply)
 int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
     if (!enter_node(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
-    if (ply >= MAX_PLY - 2) return evaluate(pos);
+    if (ply >= MAX_PLY - 2) return evaluate(pos, T.nnueStack);
     // a repetition needs at least four plies since the last irreversible move
     if (pos.fifty >= 100 || (pos.fifty >= 4 && is_repetition(pos))) return 0;
+
+    // Enter the transposition table here too. Entries stored by the deeper
+    // alpha-beta lines often bound the same position seen in quiescence; taking
+    // the cutoff (or at least ordering the TT move first) saves captures.
+    uint16_t ttMove = 0;
+    int ttScore = 0, ttDepth = 0, ttBound = BOUND_NONE;
+    if (tt.probe(pos.key, ttMove, ttScore, ttDepth, ttBound)) {
+        const int s = score_from_tt(ttScore, ply);
+        if (ttBound == BOUND_EXACT ||
+            (ttBound == BOUND_LOWER && s >= beta) ||
+            (ttBound == BOUND_UPPER && s <= alpha))
+            return s;
+    }
 
     const bool chk = in_check(pos);
     int best;
     if (chk) {
         best = -INF;
     } else {
-        best = evaluate(pos);
+        best = evaluate(pos, T.nnueStack);
         if (best >= beta) return best;
         if (best > alpha) alpha = best;
     }
@@ -1268,13 +1363,15 @@ int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
         const uint16_t m = ml.m[i];
         const int mt = mv_type(m);
         int s;
-        if (is_promo(mt)) {
-            s = 50000 + promo_type(mt);
+        if (m == ttMove) {
+            s = 1000000;
         } else if (is_capture(mt)) {
             int victim = (mt == MT_EP) ? PAWN : pc_type(pos.sq[mv_to(m)]);
             int attacker = pc_type(pos.sq[mv_from(m)]);
             if (SEE_VAL[victim] < SEE_VAL[attacker]) s = -100000 + victim;
             else                                     s = victim * 64 - attacker;
+        } else if (is_promo(mt)) {
+            s = 50000 + promo_type(mt);
         } else {
             s = 0;
         }
@@ -1292,12 +1389,12 @@ int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
 
         const int movedPc = pos.sq[mv_from(m)];
         Undo u;
-        make_move(pos, m, u);
-        if (illegal(pos)) { unmake(pos, u, movedPc); continue; }
+        make_move(pos, m, u, T.nnueStack);
+        if (illegal(pos)) { unmake(pos, u, movedPc, T.nnueStack); continue; }
         moveCount++;
 
         int v = -qsearch(T, pos, -beta, -alpha, ply + 1);
-        unmake(pos, u, movedPc);
+        unmake(pos, u, movedPc, T.nnueStack);
         if (g_stop.load(std::memory_order_relaxed)) return 0;
 
         if (v > best) {
@@ -1323,7 +1420,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
 
     if (!enter_node(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
-    if (ply >= MAX_PLY - 2) return evaluate(pos);
+    if (ply >= MAX_PLY - 2) return evaluate(pos, T.nnueStack);
 
     tt.prefetch(pos.key);
 
@@ -1350,7 +1447,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
     if (!pv && !chk && depth >= 4 && !ttMove) depth--;
 
     int eval = 0;
-    if (!chk) eval = evaluate(pos);
+    if (!chk) eval = evaluate(pos, T.nnueStack);
     T.evalStack[ply] = chk ? VALUE_NONE : eval;
     const bool improving = ply >= 2 && T.evalStack[ply - 2] != VALUE_NONE &&
                            eval > T.evalStack[ply - 2];
@@ -1399,10 +1496,10 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
             if (!see_ge(pos, m, pcBeta - beta + 100)) continue;
             const int movedPc = pos.sq[mv_from(m)];
             Undo u;
-            make_move(pos, m, u);
-            if (illegal(pos)) { unmake(pos, u, movedPc); continue; }
+            make_move(pos, m, u, T.nnueStack);
+            if (illegal(pos)) { unmake(pos, u, movedPc, T.nnueStack); continue; }
             int v = -negamax(T, pos, depth - 4, -pcBeta, -pcBeta + 1, ply + 1, !cutNode);
-            unmake(pos, u, movedPc);
+            unmake(pos, u, movedPc, T.nnueStack);
             if (g_stop.load(std::memory_order_relaxed)) return 0;
             if (v >= pcBeta) return v;
         }
@@ -1474,8 +1571,8 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
         const int newDepth = depth - 1;
 
         Undo u;
-        make_move(pos, m, u);
-        if (illegal(pos)) { unmake(pos, u, movedPc); continue; }
+        make_move(pos, m, u, T.nnueStack);
+        if (illegal(pos)) { unmake(pos, u, movedPc, T.nnueStack); continue; }
 
         T.moveStack[ply] = m;
         moveCount++;
@@ -1505,7 +1602,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
                 score = -negamax(T, pos, newDepth, -beta, -alpha, ply + 1, false);
         }
 
-        unmake(pos, u, movedPc);
+        unmake(pos, u, movedPc, T.nnueStack);
         if (g_stop.load(std::memory_order_relaxed)) return 0;
 
         if (score > bestScore) {
@@ -1608,6 +1705,9 @@ struct RootMove {
 
 void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
     Position& pos = T.pos;
+    // Seed the per-ply NNUE stack from the position the UCI thread prepared;
+    // every search starts from that accumulator and only computes forwards.
+    T.nnueStack.reset(pos.nnue);
 
     MoveList ml;
     gen_all<false>(pos, ml);
@@ -1628,7 +1728,7 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
     int prevScore = 0;
     int delta = 16;
     T.nodes = 0;          // cumulative for this iterate() call
-    T.evalStack[0] = evaluate(pos);
+    T.evalStack[0] = evaluate(pos, T.nnueStack);
 
     for (int d = startDepth; d <= maxDepth; ++d) {
         const int64_t soft = g_lim.soft.load(std::memory_order_relaxed);
@@ -1650,7 +1750,7 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
             for (size_t i = 0; i < rm.size(); ++i) {
                 const int movedPc = pos.sq[mv_from(rm[i].m)];
                 Undo u;
-                make_move(pos, rm[i].m, u);
+                make_move(pos, rm[i].m, u, T.nnueStack);
                 // ply 1 derives its counter-move and continuation-history keys
                 // from the root move; without this it reads a stale slot.
                 T.moveStack[0] = rm[i].m;
@@ -1661,7 +1761,7 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
                     sc = -negamax(T, pos, d - 1, -a - 1, -a, 1, true);
                     if (sc > a) sc = -negamax(T, pos, d - 1, -beta, -a, 1, false);
                 }
-                unmake(pos, u, movedPc);
+                unmake(pos, u, movedPc, T.nnueStack);
                 if (g_stop.load(std::memory_order_relaxed)) break;
                 rm[i].score = sc;
                 if (sc > localBest) localBest = sc;
@@ -1961,6 +2061,29 @@ void init_threads(int n, const Position* seed = nullptr) {
     }
 }
 
+// The desktop executable embeds three networks instead of one and picks between
+// them from the tapered-evaluation phase of the root position (0..24 material
+// points, 24 = the untouched opening position). It follows how Patricia splits
+// its nets: a full board is still an opening, a sparse one already an endgame.
+// The choice is made once per search, because a network cannot be swapped while
+// the accumulators of a running search are being updated move by move.
+bool g_havePhaseNets = false;
+bool g_phaseNets = true;
+int g_phaseSlot = Nnue::MIDDLEGAME_NET;
+
+int phase_slot(int phaseInc) {
+    // fingolfin is the strongest general-purpose net. finarfin takes over only
+    // in low-material endings; feanor is trained for speculative attacks and
+    // measurably loses ground in equal positions, so it is not selected here
+    // (EvalFile still makes it available for aggressive play).
+    //
+    // A full board has phaseInc 24, so <= 12 means half the material or less is
+    // left. Patricia switches to its endgame net at the same point (PhaseBound
+    // 3500 of 7800 starting material).
+    if (phaseInc <= 12) return Nnue::ENDGAME_NET;     // finarfin
+    return Nnue::MIDDLEGAME_NET;                      // fingolfin
+}
+
 void start_search(int maxDepth) {
     if (g_searching.load()) stop_search();
     g_stop.store(false, std::memory_order_relaxed);
@@ -2005,6 +2128,22 @@ int main(int argc, char** argv) {
         loaded = Nnue::load_embedded();
         if (loaded) evalFile += " (embedded)";
     }
+    // The endgame and aggressive networks are always linked into the exe; load
+    // them so every search can pick the evaluator that matches the position.
+    if (loaded) {
+        const bool endgame = Nnue::load_embedded(Nnue::ENDGAME_NET);
+        const bool aggressive = Nnue::load_embedded(Nnue::AGGRESSIVE_NET);
+        Nnue::select(Nnue::MIDDLEGAME_NET);  // loading a slot makes it active
+        if (endgame && aggressive) {
+            g_havePhaseNets = true;
+            evalFile += " + finarfin + feanor";
+        } else {
+            g_phaseNets = false;
+            std::cerr << "info string NNUE: phase networks unavailable; single-network evaluation\n";
+        }
+    } else {
+        g_phaseNets = false;
+    }
     if (loaded) std::cerr << "info string NNUE loaded: " << evalFile << '\n';
     else std::cerr << "info string NNUE unavailable; using handcrafted evaluation\n";
 
@@ -2026,6 +2165,8 @@ int main(int argc, char** argv) {
             std::cout << "option name Hash type spin default 256 min 1 max 8192\n";
             std::cout << "option name Threads type spin default 1 min 1 max 128\n";
             std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
+            std::cout << "option name PhaseNets type check default "
+                      << (g_havePhaseNets ? "true" : "false") << "\n";
             std::cout << "option name EvalFile type string default nnue/fingolfin.nnue\n";
             std::cout << "uciok" << std::endl;
         }
@@ -2041,12 +2182,26 @@ int main(int argc, char** argv) {
             if (name == "Hash") { stop_search(); g_hashMB = std::atoi(val.c_str()); tt.resize(g_hashMB); }
             else if (name == "Threads") { g_threadCount = std::max(1, std::atoi(val.c_str())); }
             else if (name == "Move Overhead") { g_moveOverhead = std::max(0, std::atoi(val.c_str())); }
+            else if (name == "PhaseNets") {
+                stop_search();
+                const bool enable = (val == "true" || val == "1");
+                g_phaseNets = enable && g_havePhaseNets;
+                // Scores made with another network are not comparable; drop them.
+                if (g_phaseSlot != Nnue::MIDDLEGAME_NET) tt.clear();
+                Nnue::select(Nnue::MIDDLEGAME_NET);
+                g_phaseSlot = Nnue::MIDDLEGAME_NET;
+                Nnue::reset(board.nnue, board.sq);
+            }
             else if (name == "EvalFile") {
                 stop_search();
                 evalFile = val;
                 if (!Nnue::load(evalFile)) std::cerr << "info string NNUE load failed; retaining current evaluator: " << evalFile << '\n';
                 else {
                     std::cerr << "info string NNUE loaded: " << evalFile << '\n';
+                    // An explicitly chosen network wins over the per-phase choice.
+                    g_phaseNets = false;
+                    g_phaseSlot = Nnue::MIDDLEGAME_NET;
+                    tt.clear();
                     Nnue::reset(board.nnue, board.sq);
                 }
             }
@@ -2122,6 +2277,19 @@ int main(int argc, char** argv) {
             g_go.stm = board.stm;
             g_go.valid = true;
             apply_go_limits(g_go, infinite);
+
+            // Pick the network for this search before any accumulator is built:
+            // the root and every thread are rebuilt from the root position below.
+            if (g_phaseNets) {
+                if (g_searching.load()) stop_search();
+                const int slot = phase_slot(board.phaseInc);
+                if (Nnue::select(slot)) {
+                    // Scores in the table were produced by the previous network;
+                    // mixing networks would reuse them as if they were comparable.
+                    if (slot != g_phaseSlot) { tt.clear(); g_phaseSlot = slot; }
+                    Nnue::reset(board.nnue, board.sq);
+                }
+            }
 
             // refresh the working copy of the position for every thread
             for (size_t i = 0; i < threads.size(); ++i) {
@@ -2207,6 +2375,10 @@ int main(int argc, char** argv) {
             int depth = 12;
             iss >> depth;
             stop_search();
+            // Fixed-network benchmark: the result must not depend on whichever
+            // phase slot the previous search happened to leave active.
+            Nnue::select(Nnue::MIDDLEGAME_NET);
+            g_phaseSlot = Nnue::MIDDLEGAME_NET;
             Position saved = board;
             U64 total = 0;
             auto t0 = Clock::now();
