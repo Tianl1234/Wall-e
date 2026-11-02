@@ -9,6 +9,17 @@ launcher icon. It is a headless UCI engine in the format Android chess GUIs disc
 (Open Exchange), so it is installed like an engine and appears only in a GUI's engine
 list. `android/README.md` documents the protocol and how to import it.
 
+## Download
+
+- [wall-e.tiny.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.5-android/wall-e.tiny.apk)
+  — one network (fingolfin), 2.2 MB.
+- [wall-e.strong.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.5-android/wall-e.strong.apk)
+  — three phase networks (fingolfin/finarfin/feanor), 5.9 MB.
+
+Both are versionCode 10 / versionName 1.3.5, signed with the same key as earlier
+releases and upgrade in place. The same files are kept under versioned names in `apk/`
+(`Wall-E-engine-1.3.5.apk` and `Wall-E-engine-1.3.5-strong.apk`).
+
 ## Layout
 
 ```
@@ -26,17 +37,81 @@ build/                 local build output (host test binaries, APK staging)
 
 ```sh
 cd android
-VARIANT=tiny   bash build_apk.sh   # -> ../build/wall-e.tiny.apk
-VARIANT=strong bash build_apk.sh   # -> ../build/wall-e.strong.apk
+VARIANT=tiny   bash build_apk.sh   # -> ../build/wall-e.tiny.apk   (one network)
+VARIANT=strong bash build_apk.sh   # -> ../build/wall-e.strong.apk (three phase networks)
 ```
-
-Both packages contain arm64-v8a and x86_64 code with the network embedded. `tiny`
-carries fingolfin only; `strong` adds the finarfin and feanor phase networks. They
-use different application ids, so they install side by side.
 
 Requires JDK 17+ and an Android SDK with `platforms;android-34`,
 `build-tools;36.1.0` (D8 in 34.0.0 crashes on modern javac output) and
 `ndk;27.3.13750724`. No Gradle.
+
+## Engine changes for ARM and version 1.3
+
+The desktop engine hard-coded BMI2 (`_pext_u64`, `_pdep_u64`) and x86 SIMD headers, so it
+could not compile for a phone. Three changes fix that without touching the search:
+
+1. **Portable slider backend.** Magic bitboards with multipliers generated offline
+   (`build/gen_magics.cpp`) and embedded as constants. Chosen over a runtime search because
+   the hardest squares need hundreds of thousands of attempts, which is far too slow at
+   app launch. A collision check at table build time turns a wrong constant into a loud
+   failure rather than silent misbehaviour.
+   The x86 build still uses PEXT; `-DWALLE_NO_PEXT` forces the portable path for testing.
+2. **NEON NNUE.** `nnue.cpp` gained NEON implementations of the three hot kernels
+   (saturating accumulator add, batched delta apply, output-layer inference), written to
+   match the x86 arithmetic exactly: wrapping int16 products, 32-bit accumulation, same
+   rounding. Scalar code remains as the final fallback.
+3. **Embedded network.** A GUI executes the engine from the APK's lib directory, where no
+   `nnue/` folder exists, so Android builds link the network into the binary
+   (`nnue_embedded.cpp`) and load it with `Nnue::load_embedded()`.
+4. **Incremental NNUE optimization (v1.3).** Apply each added/removed feature directly to
+   each perspective's int16 accumulator with saturating SIMD operations (NEON on ARM64),
+   rather than allocating and reducing a two-perspective int32 delta buffer on each move.
+5. **PIE.** Android requires position-independent executables; the NDK build produces one.
+
+## Changes in 1.3.5
+
+This release cuts per-node evaluation cost, trims qsearch work and gives the phone
+package a second search thread by default.
+
+- **Batched accumulator updates.** A move changes at most two features per perspective
+  (castle, capture-promotion). `make_move` now collects all adds and subs into one
+  `Nnue::Update` and applies them in a single load/update/store pass, adds before subs,
+  instead of one full accumulator pass per changed feature. Mirrors Patricia's update
+  kernel (MIT, Adam Kulju), whose networks this engine embeds.
+- **Per-ply accumulator stack.** The search keeps one accumulator per ply in
+  `ThreadData::nnueStack`, computed forwards on `make_move`; `unmake` only pops. The old
+  design applied the inverse update on every unmake, so taking a move back cost as much
+  as making it. Updates are materialized lazily from the nearest computed ancestor, with
+  a prefetch of the next update's feature rows and a per-slot evaluation cache. `verify`
+  walks the same stack path and still reports zero inconsistencies over millions of
+  nodes.
+- **SCReLU flatten with eight accumulators.** The output layer (`infer_avx2`, NEON
+  `infer`) now keeps eight independent int32 accumulators. Products are `a · (a · w)`
+  in wrapping int16 then widened, exactly as before, so evaluation is bit-identical;
+  the extra chains just hide multiply latency.
+- **Transposition table in qsearch.** Quiet and capture cutoffs now consult the shared
+  table before searching captures (Stockfish construct), and a stored move is tried
+  first when it is a capture or promotion. On the bench set this removes about 16% of
+  the nodes at the same depth.
+- **Two threads by default on Android.** The Android package starts with `Threads=2`,
+  since phone GUIs rarely change it and the phone has several cores. A 16-game host
+  match at 100 ms per move scored 10-4 (2 draws) for two threads against one; desktop
+  test builds keep the single-thread default. The table is shared between threads.
+- **Phase-network consistency (strong package).** Choosing a different network for a
+  search now clears the transposition table first, so scores produced under one network
+  are not reused as if they came from the network that is now active.
+- **Time management.** `go movetime X` searches until 90% of `X - Move Overhead`
+  (was 60%), so a GUI that grants 2 s no longer gets a ~1 s move.
+- **Transposition table replacement.** On a bucket miss the store now respects the
+  generation counter: it keeps current-generation entries and only replaces a
+  same-generation entry when the candidate is shallower. Previously a deep current
+  entry could be overwritten by a shallow entry from an older search.
+- **Root continuation history.** The root move is written to `moveStack[0]` before
+  searching its subtree; ply 1 derives its counter-move and continuation-history keys
+  from it and was reading a stale slot.
+
+A Stockfish-style capture history was implemented and measured, but a 16-game match
+against the same engine without it finished 6-6 with 4 draws, so it was not kept.
 
 ## Version 1.3.3 — AVX2 NNUE for x86_64
 
@@ -128,28 +203,34 @@ could not compile for a phone. These changes fixed that without touching the sea
 
 ## Verification done here
 
-- Portable slider path on x86 (`-DWALLE_NO_PEXT`): all six standard perft positions pass,
-  and  `bench 12` yields exactly the same node count as the PEXT build (912,862 nodes).
-- Host build after the load refactor: `NNUE loaded: nnue/fingolfin.nnue`,
-  `perft 5` = 4,865,609, `bench 12` = 912,862 nodes.
+- Host build (`-march=znver5`): `perft 5` = 4,865,609, `verify 4` = 197,281 nodes with
+  0 inconsistent, `bench 12` = 556,713 nodes in ~155 ms (3.5 Mnps). Before the qsearch
+  table probe the same bench searched 665,358 nodes in ~164 ms, so the reduction costs
+  no strength: a 16-game 60 ms match between the two builds finished 7-7 with 4 draws.
+- Reference positions: Kiwipete perft(4) = 4,085,603, position 3 perft(5) = 674,624,
+  position 4 perft(4) = 422,333, position 5 perft(4) = 2,103,487, position 6 perft(3) =
+  89,890, all matching the published counts; `verify 3`/`verify 4` clean on the same
+  positions and on replayed self-play games.
+- `Threads=2` bench and `verify 3` run clean; the 16-game two-thread match above also
+  replayed and verified both engines' final positions.
 - Cross-compiled engines: AArch64 and x86-64 ELF `ET_DYN` PIE, entry points set,
   LOAD alignment 16 KiB, no text relocations, only `libc`/`libm`/`libdl` needed;
-  the network's bytes are present inside both binaries.
-- APKs: `com.tianl1234.walle` and `com.tianl1234.walle.strong`, versionCode 8 /
-  versionName 1.3.3, minSdk 26, targetSdk 34, `extractNativeLibs=true`, native code
-  `arm64-v8a` + `x86_64`, **no launcher category** (so no icon), OEX
-  activity/provider/enginelist present, signature verifies (v2 + v3).
-- 1.3.3 x86_64 libraries: `.text` section is identical to a locally rebuilt
-  unstripped library, contain the AVX2 kernels and the `have_avx2()` dispatch, and
-  embed the networks byte-for-byte (one in `tiny`, three in `strong`).
+  the NEON kernels are present (`smull`/`smlal`, `sqadd`/`sqsub`, `addv`) and the
+  network's bytes are inside the binary.
+- APK: versionCode 10 / versionName 1.3.5, minSdk 26, targetSdk 34,
+  `extractNativeLibs=true`, native code `arm64-v8a` + `x86_64`, **no launcher category**
+  (so no icon), OEX activity/provider/enginelist present, signature verifies (v2 + v3).
+- Installed and executed under Windows Subsystem for Android 13 (x86_64): `perft 5` =
+  4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes in
+  ~199 ms, a `Threads=4` depth-16 search completes, and the strong package loads all
+  three networks and searches across a phase switch. This exercises the x86_64 build,
+  not the ARM64 NEON path.
 
 Build the current APK with `android/build_apk.sh`; rerun native and package checks after
 changes before quoting updated performance or APK checksum results.
 
 ## Known limitation
 
-There is no ARM device or emulator on this machine, so the ARM package could not be
-installed or launched here. The NEON kernels and the extraction/exec path are
-compile- and structure-verified only. The x86_64 kernels were additionally executed
-natively at the same baseline (see the 1.3.3 table). On a phone, the first meaningful
+The ARM64 package has still not run on ARM hardware; WSA is x86_64, so the NEON NNUE
+kernels remain compile- and structure-verified only. On a phone, the first meaningful
 test is `perft 5` from the GUI, which must return 4,865,609.

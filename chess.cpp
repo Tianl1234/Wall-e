@@ -507,6 +507,41 @@ struct Undo {
     uint16_t move;
 };
 
+// One NNUE accumulator per ply, computed lazily. make_move only records the
+// pending feature delta; the accumulator is materialized the first time the
+// position is actually evaluated, which skips the work entirely at nodes that
+// return from the TT or from a pruning rule before evaluation. unmake just
+// pops. Patricia (MIT) uses the same layout; its network is bundled here.
+struct NnueStack {
+    static constexpr int NO_EVAL = -1000000;
+    Nnue::Accumulator slots[MAX_PLY + 2];
+    Nnue::Update pending[MAX_PLY + 2];
+    bool dirty[MAX_PLY + 2] = {};
+    int eval[MAX_PLY + 2];
+    int8_t evalColor[MAX_PLY + 2];
+    int ply = 0;
+    void reset(const Nnue::Accumulator& root) {
+        ply = 0;
+        slots[0] = root;
+        dirty[0] = false;
+        eval[0] = NO_EVAL;
+    }
+};
+
+// Bring slots[ply] up to date by replaying the pending deltas from the nearest
+// materialized ancestor. The chain is usually one deep; deeper only when a
+// node was never evaluated (check nodes), and the rows of the next update are
+// prefetched while the current one is applied.
+inline void materialize(NnueStack& s) {
+    int base = s.ply;
+    while (base > 0 && s.dirty[base]) --base;
+    for (int i = base + 1; i <= s.ply; ++i) {
+        if (i + 1 <= s.ply) Nnue::prefetch_update(s.pending[i + 1]);
+        Nnue::apply_update(s.slots[i], s.slots[i - 1], s.pending[i]);
+        s.dirty[i] = false;
+    }
+}
+
 struct Position {
     U64 bb[16];
     U64 byType[7];
@@ -570,14 +605,15 @@ inline void push_key(Position& p) {
     p.keyHist[p.histSize++] = p.key;
 }
 
-inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) {
+inline void make_move_core(Position& p, uint16_t m, Undo& u, bool updateNnue, NnueStack* stack) {
     const int from = mv_from(m), to = mv_to(m), mt = mv_type(m);
     const int us = p.stm, them = us ^ 1;
     const int pc = p.sq[from];
-    Nnue::PieceChange nnueChanges[4];
-    int nnueChangeCount = 0;
+    Nnue::Update nnueUpdate;
     auto recordNnue = [&](int piece, int square, bool add) {
-        if (updateNnue) nnueChanges[nnueChangeCount++] = {pc_color(piece), pc_type(piece), square, add};
+        if (!updateNnue) return;
+        if (add) nnueUpdate.addPiece(pc_color(piece), pc_type(piece), square);
+        else     nnueUpdate.subPiece(pc_color(piece), pc_type(piece), square);
     };
 
     u.key = p.key;
@@ -618,7 +654,17 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
         add_piece(p, rook, rt);
     }
 
-    if (updateNnue) Nnue::apply_changes(p.nnue, nnueChanges, nnueChangeCount);
+    if (updateNnue) {
+        if (stack) {
+            const int child = stack->ply + 1;
+            stack->pending[child] = nnueUpdate;
+            stack->dirty[child] = true;
+            stack->eval[child] = NnueStack::NO_EVAL;
+            ++stack->ply;
+        } else {
+            Nnue::apply_update(p.nnue, p.nnue, nnueUpdate);
+        }
+    }
     p.fifty = (captured != EMPTY || pc_type(pc) == PAWN) ? 0 : p.fifty + 1;
     p.ep = (mt == MT_DOUBLE) ? ((from + to) >> 1) : -1;
     p.castling &= (int)(CastleMask[from] & CastleMask[to]);
@@ -630,17 +676,29 @@ inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) 
     push_key(p);
 }
 
-inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = true) {
+// Search moves: the accumulator is derived from the previous ply and kept on
+// the stack. Other callers (perft, verify, UCI position setup) update the
+// Position's own accumulator in place, as before.
+inline void make_move(Position& p, uint16_t m, Undo& u, NnueStack& stack) {
+    make_move_core(p, m, u, true, &stack);
+}
+
+inline void make_move(Position& p, uint16_t m, Undo& u, bool updateNnue = true) {
+    make_move_core(p, m, u, updateNnue, nullptr);
+}
+
+inline void unmake_core(Position& p, const Undo& u, int movedPc, bool updateNnue, NnueStack* stack) {
     const uint16_t m = u.move;
     const int from = mv_from(m), to = mv_to(m), mt = mv_type(m);
     const int us = p.stm ^ 1;
 
     p.histSize--;
 
-    Nnue::PieceChange nnueChanges[4];
-    int nnueChangeCount = 0;
+    Nnue::Update nnueUpdate;
     auto recordNnue = [&](int piece, int square, bool add) {
-        if (updateNnue) nnueChanges[nnueChangeCount++] = {pc_color(piece), pc_type(piece), square, add};
+        if (!updateNnue) return;
+        if (add) nnueUpdate.addPiece(pc_color(piece), pc_type(piece), square);
+        else     nnueUpdate.subPiece(pc_color(piece), pc_type(piece), square);
     };
     if (is_promo(mt)) {
         recordNnue(make_pc(us, promo_type(mt)), to, false);
@@ -674,7 +732,8 @@ inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = tr
         add_piece(p, u.captured, capsq);
     }
 
-    if (updateNnue) Nnue::apply_changes(p.nnue, nnueChanges, nnueChangeCount);
+    if (stack) --stack->ply;
+    else if (updateNnue) Nnue::revert_update(p.nnue, p.nnue, nnueUpdate);
     // scalars last: the add/remove calls above touched key/mg/eg/phaseInc
     p.stm = us;
     p.key = u.key;
@@ -684,6 +743,14 @@ inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = tr
     p.castling = u.castling;
     p.ep = (u.ep == 64) ? -1 : (int)u.ep;
     p.fifty = u.fifty;
+}
+
+inline void unmake(Position& p, const Undo& u, int movedPc, NnueStack& stack) {
+    unmake_core(p, u, movedPc, true, &stack);
+}
+
+inline void unmake(Position& p, const Undo& u, int movedPc, bool updateNnue = true) {
+    unmake_core(p, u, movedPc, updateNnue, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,6 +1177,17 @@ int evaluate_classical(const Position& p) {
     return (p.stm == WHITE) ? v : -v;
 }
 
+inline int evaluate(const Position& p, NnueStack& s) {
+    if (!Nnue::available()) return evaluate_classical(p);
+    const int slot = s.ply;
+    if (s.eval[slot] != NnueStack::NO_EVAL && s.evalColor[slot] == p.stm) return s.eval[slot];
+    materialize(s);
+    const int v = Nnue::evaluate(s.slots[slot], p.stm);
+    s.eval[slot] = v;
+    s.evalColor[slot] = (int8_t)p.stm;
+    return v;
+}
+
 inline int evaluate(const Position& p) {
     return Nnue::available() ? Nnue::evaluate(p.nnue, p.stm) : evaluate_classical(p);
 }
@@ -1177,9 +1255,14 @@ struct TT {
         if (!slot) {
             slot = &b[0];
             for (int i = 1; i < 4; ++i) {
-                int si = (slot->genBound >> 2), bi2 = (b[i].genBound >> 2);
-                if (bi2 != gen && si == gen) slot = &b[i];
-                else if (bi2 == si && b[i].depth < slot->depth) slot = &b[i];
+                const int slotGen = slot->genBound >> 2;
+                const int entryGen = b[i].genBound >> 2;
+                if (entryGen != slotGen) {
+                    if (slotGen == gen) continue;          // keep a current-generation entry
+                    if (entryGen == gen) slot = &b[i];     // else prefer the current generation
+                } else if (b[i].depth < slot->depth) {
+                    slot = &b[i];                          // same generation: replace shallower
+                }
             }
         } else {
             if (slot->depth > depth + 2 && bound != BOUND_EXACT) return;
@@ -1249,6 +1332,7 @@ struct ThreadData {
     std::vector<int16_t> contHist;
     uint16_t moveStack[MAX_PLY + 2];
     int evalStack[MAX_PLY + 2];
+    NnueStack nnueStack;
     U64 nodes = 0;
     int seldepth = 0;
     int id = 0;
@@ -1314,16 +1398,29 @@ int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
     T.nodes++;
     if ((T.nodes & 1023) == 0 && check_stop(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
-    if (ply >= MAX_PLY - 2) return evaluate(pos);
+    if (ply >= MAX_PLY - 2) return evaluate(pos, T.nnueStack);
     // a repetition needs at least four plies since the last irreversible move
     if (pos.fifty >= 100 || (pos.fifty >= 4 && is_repetition(pos))) return 0;
+
+    // Enter the transposition table here too. Entries stored by the deeper
+    // alpha-beta lines often bound the same position seen in quiescence; taking
+    // the cutoff (or at least ordering the TT move first) saves captures.
+    uint16_t ttMove = 0;
+    int ttScore = 0, ttDepth = 0, ttBound = BOUND_NONE;
+    if (tt.probe(pos.key, ttMove, ttScore, ttDepth, ttBound)) {
+        const int s = score_from_tt(ttScore, ply);
+        if (ttBound == BOUND_EXACT ||
+            (ttBound == BOUND_LOWER && s >= beta) ||
+            (ttBound == BOUND_UPPER && s <= alpha))
+            return s;
+    }
 
     const bool chk = in_check(pos);
     int best;
     if (chk) {
         best = -INF;
     } else {
-        best = evaluate(pos);
+        best = evaluate(pos, T.nnueStack);
         if (best >= beta) return best;
         if (best > alpha) alpha = best;
     }
@@ -1337,7 +1434,9 @@ int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
         const uint16_t m = ml.m[i];
         const int mt = mv_type(m);
         int s;
-        if (is_capture(mt)) {
+        if (m == ttMove) {
+            s = 1000000;
+        } else if (is_capture(mt)) {
             int victim = (mt == MT_EP) ? PAWN : pc_type(pos.sq[mv_to(m)]);
             int attacker = pc_type(pos.sq[mv_from(m)]);
             if (SEE_VAL[victim] < SEE_VAL[attacker]) s = -100000 + victim;
@@ -1361,12 +1460,12 @@ int qsearch(ThreadData& T, Position& pos, int alpha, int beta, int ply) {
 
         const int movedPc = pos.sq[mv_from(m)];
         Undo u;
-        make_move(pos, m, u);
-        if (illegal(pos)) { unmake(pos, u, movedPc); continue; }
+        make_move(pos, m, u, T.nnueStack);
+        if (illegal(pos)) { unmake(pos, u, movedPc, T.nnueStack); continue; }
         moveCount++;
 
         int v = -qsearch(T, pos, -beta, -alpha, ply + 1);
-        unmake(pos, u, movedPc);
+        unmake(pos, u, movedPc, T.nnueStack);
         if (g_stop.load(std::memory_order_relaxed)) return 0;
 
         if (v > best) {
@@ -1393,7 +1492,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
     T.nodes++;
     if ((T.nodes & 1023) == 0 && check_stop(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
-    if (ply >= MAX_PLY - 2) return evaluate(pos);
+    if (ply >= MAX_PLY - 2) return evaluate(pos, T.nnueStack);
 
     tt.prefetch(pos.key);
 
@@ -1420,7 +1519,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
     if (!pv && !chk && depth >= 4 && !ttMove) depth--;
 
     int eval = 0;
-    if (!chk) eval = evaluate(pos);
+    if (!chk) eval = evaluate(pos, T.nnueStack);
     T.evalStack[ply] = chk ? VALUE_NONE : eval;
     const bool improving = ply >= 2 && T.evalStack[ply - 2] != VALUE_NONE &&
                            eval > T.evalStack[ply - 2];
@@ -1469,10 +1568,10 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
             if (!see_ge(pos, m, pcBeta - beta + 100)) continue;
             const int movedPc = pos.sq[mv_from(m)];
             Undo u;
-            make_move(pos, m, u);
-            if (illegal(pos)) { unmake(pos, u, movedPc); continue; }
+            make_move(pos, m, u, T.nnueStack);
+            if (illegal(pos)) { unmake(pos, u, movedPc, T.nnueStack); continue; }
             int v = -negamax(T, pos, depth - 4, -pcBeta, -pcBeta + 1, ply + 1, !cutNode);
-            unmake(pos, u, movedPc);
+            unmake(pos, u, movedPc, T.nnueStack);
             if (g_stop.load(std::memory_order_relaxed)) return 0;
             if (v >= pcBeta) return v;
         }
@@ -1543,8 +1642,8 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
         const int newDepth = depth - 1;
 
         Undo u;
-        make_move(pos, m, u);
-        if (illegal(pos)) { unmake(pos, u, movedPc); continue; }
+        make_move(pos, m, u, T.nnueStack);
+        if (illegal(pos)) { unmake(pos, u, movedPc, T.nnueStack); continue; }
 
         T.moveStack[ply] = m;
         moveCount++;
@@ -1573,7 +1672,7 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
                 score = -negamax(T, pos, newDepth, -beta, -alpha, ply + 1, false);
         }
 
-        unmake(pos, u, movedPc);
+        unmake(pos, u, movedPc, T.nnueStack);
         if (g_stop.load(std::memory_order_relaxed)) return 0;
 
         if (score > bestScore) {
@@ -1676,6 +1775,9 @@ struct RootMove {
 
 void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
     Position& pos = T.pos;
+    // Seed the per-ply NNUE stack from the position the UCI thread prepared;
+    // every search starts from that accumulator and only computes forwards.
+    T.nnueStack.reset(pos.nnue);
 
     MoveList ml;
     gen_all<false>(pos, ml);
@@ -1716,7 +1818,10 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
             for (size_t i = 0; i < rm.size(); ++i) {
                 const int movedPc = pos.sq[mv_from(rm[i].m)];
                 Undo u;
-                make_move(pos, rm[i].m, u);
+                make_move(pos, rm[i].m, u, T.nnueStack);
+                // ply 1 derives its counter-move and continuation-history keys
+                // from the root move; without this it reads a stale slot.
+                T.moveStack[0] = rm[i].m;
                 int sc;
                 if (i == 0) {
                     sc = -negamax(T, pos, d - 1, -beta, -a, 1, false);
@@ -1724,7 +1829,7 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
                     sc = -negamax(T, pos, d - 1, -a - 1, -a, 1, true);
                     if (sc > a) sc = -negamax(T, pos, d - 1, -beta, -a, 1, false);
                 }
-                unmake(pos, u, movedPc);
+                unmake(pos, u, movedPc, T.nnueStack);
                 if (g_stop.load(std::memory_order_relaxed)) break;
                 rm[i].score = sc;
                 if (sc > localBest) localBest = sc;
@@ -1903,7 +2008,8 @@ U64 compute_key(Position& p) {
     return k;
 }
 
-bool check_consistency(const Position& p, std::string& why) {
+bool check_consistency(const Position& p, std::string& why,
+                       const Nnue::Accumulator* nnueAcc = nullptr) {
     int mg, eg, ph;
     U64 key;
     recompute(p, mg, eg, ph, key);
@@ -1922,13 +2028,14 @@ bool check_consistency(const Position& p, std::string& why) {
     }
     if (all != p.all) { why = "all"; return false; }
     if ((p.occ[WHITE] | p.occ[BLACK]) != p.all) { why = "occ"; return false; }
-    if (!Nnue::consistent(p.nnue, p.sq)) { why = "nnue"; return false; }
+    if (!Nnue::consistent(nnueAcc ? *nnueAcc : p.nnue, p.sq)) { why = "nnue"; return false; }
     return true;
 }
 
-U64 verify_tree(Position& p, int depth, int& bad) {
+U64 verify_tree(Position& p, int depth, int& bad, NnueStack& nnueStack) {
     std::string why;
-    if (!check_consistency(p, why)) {
+    materialize(nnueStack);
+    if (!check_consistency(p, why, &nnueStack.slots[nnueStack.ply])) {
         if (!bad) std::cout << "info string INCONSISTENT (" << why << ")" << std::endl;
         bad++;
         return 0;
@@ -1940,9 +2047,9 @@ U64 verify_tree(Position& p, int depth, int& bad) {
     for (int i = 0; i < ml.n; ++i) {
         const int movedPc = p.sq[mv_from(ml.m[i])];
         Undo u;
-        make_move(p, ml.m[i], u);
-        if (!illegal(p)) n += verify_tree(p, depth - 1, bad);
-        unmake(p, u, movedPc);
+        make_move(p, ml.m[i], u, nnueStack);
+        if (!illegal(p)) n += verify_tree(p, depth - 1, bad, nnueStack);
+        unmake(p, u, movedPc, nnueStack);
     }
     return n;
 }
@@ -1952,7 +2059,14 @@ U64 verify_tree(Position& p, int depth, int& bad) {
 // ---------------------------------------------------------------------------
 std::thread searchThread;
 std::atomic<bool> g_searching{false};
+// The phone package runs on a multi-core ARM device and most Android GUIs never
+// change the default, so give it a second search thread out of the box. Desktop
+// test builds keep the usual single-thread default.
+#if defined(WALLE_EMBEDDED_NET)
+int g_threadCount = 2;
+#else
 int g_threadCount = 1;
+#endif
 int g_hashMB = 256;
 int g_moveOverhead = 30;
 
@@ -1969,7 +2083,7 @@ void apply_go_limits(const GoParams& gp, bool infinite) {
 
     if (gp.movetime > 0) {
         g_lim.hard = std::max<int64_t>(1, gp.movetime - g_moveOverhead);
-        g_lim.soft = std::max<int64_t>(1, g_lim.hard * 6 / 10);
+        g_lim.soft = std::max<int64_t>(1, g_lim.hard * 9 / 10);
     } else if (!infinite && (gp.wtime > 0 || gp.btime > 0)) {
         int64_t myTime = (gp.stm == WHITE) ? gp.wtime : gp.btime;
         int64_t myInc  = (gp.stm == WHITE) ? gp.winc : gp.binc;
@@ -1993,6 +2107,7 @@ void apply_go_limits(const GoParams& gp, bool infinite) {
 // made once per search, because a network cannot be swapped while the accumulators
 // of a running search are being updated move by move.
 bool g_phaseNets = true;
+int g_phaseSlot = Nnue::MIDDLEGAME_NET;
 
 int phase_slot(int phaseInc) {
     if (phaseInc <= 8) return Nnue::ENDGAME_NET;      // finarfin
@@ -2092,7 +2207,8 @@ int main(int argc, char** argv) {
             std::cout << "id name Wall-E 2\n";
             std::cout << "id author You\n";
             std::cout << "option name Hash type spin default 256 min 1 max 8192\n";
-            std::cout << "option name Threads type spin default 1 min 1 max 128\n";
+            std::cout << "option name Threads type spin default " << g_threadCount
+                      << " min 1 max 128\n";
             std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
             std::cout << "option name EvalFile type string default nnue/fingolfin.nnue\n";
             std::cout << "uciok" << std::endl;
@@ -2191,8 +2307,15 @@ int main(int argc, char** argv) {
 #if defined(WALLE_PHASE_NETS)
             // Pick the network for this search before any accumulator is built:
             // the accumulators of the root and of every thread are rebuilt here.
-            if (g_phaseNets && Nnue::select(phase_slot(board.phaseInc)))
-                Nnue::reset(board.nnue, board.sq);
+            if (g_phaseNets) {
+                const int slot = phase_slot(board.phaseInc);
+                if (Nnue::select(slot)) {
+                    // Scores in the table were produced by the previous network;
+                    // mixing networks would reuse them as if they were comparable.
+                    if (slot != g_phaseSlot) { tt.clear(); g_phaseSlot = slot; }
+                    Nnue::reset(board.nnue, board.sq);
+                }
+            }
 #endif
 
             // refresh the working copy of the position for every thread
@@ -2259,7 +2382,9 @@ int main(int argc, char** argv) {
             iss >> d;
             int bad = 0;
             Position tmp = board;
-            U64 n = verify_tree(tmp, d, bad);
+            NnueStack stack;
+            stack.reset(tmp.nnue);
+            U64 n = verify_tree(tmp, d, bad, stack);
             std::cout << "info string verify depth " << d << " nodes " << n
                       << " inconsistent " << bad << std::endl;
         }

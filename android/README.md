@@ -42,7 +42,7 @@ copied from working engine APKs rather than invented:
 
 ```xml
 <enginelist>
-    <engine name="Wall-E 1.3" filename="libwalle.so" target="arm64-v8a|x86_64" />
+    <engine name="Wall-E 1.3.5" filename="libwalle.so" target="arm64-v8a|x86_64" />
 </enginelist>
 ```
 
@@ -68,18 +68,21 @@ plays, but with the weaker handcrafted evaluation.
 
 ## Using it
 
-1. Install `Wall-E-engine-1.3.3.apk` (it will not appear in the launcher — by design).
-   `Wall-E-engine-1.3.3-strong.apk` is the three-network variant; install it too if you
-   want to compare, or instead of the default package.
+1. Install `build/wall-e.tiny.apk` (one network) or `build/wall-e.strong.apk` (three phase
+   networks, larger). It will not appear in the launcher — by design.
 2. In a GUI that supports OEX engines (Chess for Android, Chessis, and other
    kalab-based GUIs), open the engine menu and **import/select an engine**.
-3. Pick **Wall-E 1.3.3** (or **Wall-E 1.3.3 (Strong)**) from the list.
+3. Pick **Wall-E 1.3.5** from the list.
 
 For Chess for Android specifically: long-press the notation window → *UCI and XBoard* →
-*Import engine* → *Wall-E 1.3.3*. No SD-card import step is needed.
+*Import engine* → *Wall-E 1.3.5*. No SD-card import step is needed.
 
-The APK upgrades the previous console build in place (versionCode 8, same signing
+The APK upgrades the previous engine package in place (`versionCode 10`, same signing
 key), so the old icon disappears when you install it.
+
+Both packages default to `Threads=2` because phone GUIs rarely change engine options;
+set `Threads` in the GUI if you want more or fewer. The 256 MB hash default is shared by
+both threads.
 
 ## Build
 
@@ -89,8 +92,8 @@ Requirements: JDK 17+, Android SDK with `platforms;android-34`,
 
 ```sh
 cd android
-VARIANT=tiny   bash build_apk.sh   # -> ../build/wall-e.tiny.apk
-VARIANT=strong bash build_apk.sh   # -> ../build/wall-e.strong.apk
+bash build_apk.sh                 # -> ../build/wall-e.tiny.apk   (one network)
+VARIANT=strong bash build_apk.sh  # -> ../build/wall-e.strong.apk (three networks)
 ```
 
 Toolchain paths can be overridden with `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`,
@@ -119,15 +122,21 @@ Build with `android/build_apk.sh` and refresh the results below after a successf
 | Check | Result |
 |---|---|
 | Launcher entry | none — `aapt2 dump badging` shows no `launchable-activity`, `application: icon=''`; build script enforces it |
-| Manifest | `com.tianl1234.walle` / `com.tianl1234.walle.strong`, versionCode 8 / versionName 1.3.3, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| Manifest | `com.tianl1234.walle`, versionCode 10 / versionName 1.3.5, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
 | OEX wiring | `intent.chess.provider.ENGINE`, `chess.provider.engine.authority`, exported `EngineProvider`, `res/xml/enginelist.xml` present as `xml/enginelist` |
 | Native code | verify `arm64-v8a`, `x86_64`, ELF PIE alignment and no TEXTREL after build |
 | Embedded network | verify network presence in both newly built binaries after build |
 | Signature | verify with `apksigner` after build |
-| Loader/update checks | rerun host perft and bench after the v1.3 update before citing measurements |
+| Loader/update checks | rerun host perft and bench after the v1.3.5 update before citing measurements |
 | APK contents | verify contents after build |
+| Install (WSA) | tiny and strong APKs install on Windows Subsystem for Android 13 (x86_64), versionCode 10 / versionName 1.3.5, `primaryCpuAbi=x86_64`; the OEX query resolves `com.tianl1234.walle/.EngineActivity` |
+| Runtime (WSA) | extracted `libwalle.so` executes from `nativeLibraryDir`-equivalent path: `perft 5` = 4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes in 197–199 ms (~2.8 Mnps), `Threads=4` depth-16 search completes |
+| Phase nets (WSA) | strong APK reports `NNUE loaded: <embedded network> + finarfin + feanor`; middlegame and endgame positions search cleanly across a phase switch (TT cleared, fresh node counts) |
 
-**Not checked:** the package was never installed or run on an Android device (no ARM
-hardware, no emulator, no adb here). The NEON NNUE kernels and the extraction/exec path
-are therefore compile- and structure-verified only. The first real test is `perft 5`
-from the GUI — it must return 4,865,609.
+**Not checked:** the ARM64 package has still not run on ARM hardware. WSA is x86_64 and
+therefore exercises only the x86_64 build (SSE4.2 baseline with runtime AVX2), not the
+NEON NNUE kernels; those remain compile- and structure-verified. The first phone test is
+`perft 5` from the GUI — it must return 4,865,609. The provider's `openAssetFile` path is
+also unexercised: `adb shell content read` calls `openFile` (which the provider
+intentionally does not implement), while OEX GUIs execute the binary from
+`nativeLibraryDir` in place.

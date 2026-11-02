@@ -135,17 +135,25 @@ void update_row_avx2(int16_t* dst, const int16_t* row, bool add) {
     }
 }
 
+template <int NA, int NS>
 __attribute__((target("avx2")))
-void update_row2_avx2(int16_t* dstA, int16_t* dstB, const int16_t* rowA, const int16_t* rowB, bool add) {
+void update_rows_avx2(int16_t* dstA, int16_t* dstB,
+                      const int16_t* srcA, const int16_t* srcB,
+                      const int16_t* const* addA, const int16_t* const* subA,
+                      const int16_t* const* addB, const int16_t* const* subB) {
     for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-        const __m256i wA = _mm256_load_si256(reinterpret_cast<const __m256i*>(rowA + i));
-        const __m256i wB = _mm256_load_si256(reinterpret_cast<const __m256i*>(rowB + i));
-        const __m256i vA = _mm256_load_si256(reinterpret_cast<const __m256i*>(dstA + i));
-        const __m256i vB = _mm256_load_si256(reinterpret_cast<const __m256i*>(dstB + i));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(dstA + i),
-                           add ? _mm256_adds_epi16(vA, wA) : _mm256_subs_epi16(vA, wA));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(dstB + i),
-                           add ? _mm256_adds_epi16(vB, wB) : _mm256_subs_epi16(vB, wB));
+        __m256i vA = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcA + i));
+        __m256i vB = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcB + i));
+        for (int a = 0; a < NA; ++a) {
+            vA = _mm256_adds_epi16(vA, _mm256_load_si256(reinterpret_cast<const __m256i*>(addA[a] + i)));
+            vB = _mm256_adds_epi16(vB, _mm256_load_si256(reinterpret_cast<const __m256i*>(addB[a] + i)));
+        }
+        for (int s = 0; s < NS; ++s) {
+            vA = _mm256_subs_epi16(vA, _mm256_load_si256(reinterpret_cast<const __m256i*>(subA[s] + i)));
+            vB = _mm256_subs_epi16(vB, _mm256_load_si256(reinterpret_cast<const __m256i*>(subB[s] + i)));
+        }
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dstA + i), vA);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dstB + i), vB);
     }
 }
 
@@ -154,21 +162,33 @@ int infer_avx2(const Accumulator& acc, int stm) {
     const int16_t* us = acc.values[stm];
     const int16_t* them = acc.values[stm ^ 1];
     int64_t total = static_cast<int64_t>(network->outputBias) * QA;
-    __m256i sum = _mm256_setzero_si256();
+    // Eight independent 32-bit accumulators: enough ILP to hide the multiply
+    // and multiply-add latency, and each lane sees at most 32 products of
+    // 255 x 255 x 128, far from the int32 limit. (Patricia's MIT design.)
+    __m256i sum[8] = {_mm256_setzero_si256(), _mm256_setzero_si256(),
+                      _mm256_setzero_si256(), _mm256_setzero_si256(),
+                      _mm256_setzero_si256(), _mm256_setzero_si256(),
+                      _mm256_setzero_si256(), _mm256_setzero_si256()};
     const __m256i zero = _mm256_setzero_si256();
     const __m256i maxValue = _mm256_set1_epi16(QA);
-    for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(us + i));
-        __m256i b = _mm256_load_si256(reinterpret_cast<const __m256i*>(them + i));
-        a = _mm256_min_epi16(_mm256_max_epi16(a, zero), maxValue);
-        b = _mm256_min_epi16(_mm256_max_epi16(b, zero), maxValue);
-        const __m256i wa = _mm256_load_si256(reinterpret_cast<const __m256i*>(network->outputWeights[0] + i));
-        const __m256i wb = _mm256_load_si256(reinterpret_cast<const __m256i*>(network->outputWeights[1] + i));
-        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_mullo_epi16(a, wa), a));
-        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_mullo_epi16(b, wb), b));
+    for (int i = 0; i < HIDDEN_SIZE; i += 64) {
+        for (int j = 0; j < 4; ++j) {
+            const int k = i + 16 * j;
+            __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(us + k));
+            __m256i b = _mm256_load_si256(reinterpret_cast<const __m256i*>(them + k));
+            a = _mm256_min_epi16(_mm256_max_epi16(a, zero), maxValue);
+            b = _mm256_min_epi16(_mm256_max_epi16(b, zero), maxValue);
+            const __m256i wa = _mm256_load_si256(reinterpret_cast<const __m256i*>(network->outputWeights[0] + k));
+            const __m256i wb = _mm256_load_si256(reinterpret_cast<const __m256i*>(network->outputWeights[1] + k));
+            sum[2 * j] = _mm256_add_epi32(sum[2 * j], _mm256_madd_epi16(_mm256_mullo_epi16(a, wa), a));
+            sum[2 * j + 1] = _mm256_add_epi32(sum[2 * j + 1], _mm256_madd_epi16(_mm256_mullo_epi16(b, wb), b));
+        }
     }
+    __m256i merged = _mm256_add_epi32(
+        _mm256_add_epi32(_mm256_add_epi32(sum[0], sum[1]), _mm256_add_epi32(sum[2], sum[3])),
+        _mm256_add_epi32(_mm256_add_epi32(sum[4], sum[5]), _mm256_add_epi32(sum[6], sum[7])));
     alignas(32) int32_t lanes[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), sum);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), merged);
     for (int lane : lanes) total += lane;
     return static_cast<int>((total * SCALE) /
                             (static_cast<int64_t>(QA) * QA * 64));
@@ -255,14 +275,14 @@ int infer(const Accumulator& acc, int stm) {
 #elif defined(WALLE_NEON)
     // Mirrors the x86 path: the products are taken in wrapping int16, then
     // accumulated into 32-bit lanes. Same arithmetic, same rounding.
-    // Two accumulators halve the per-lane product count, keeping the 32-bit
-    // lanes overflow-safe (256 products x 255 x 255 x 128 < 2^31), the same
-    // bound the AVX2 path naturally has.
-    int32x4_t sum0 = vdupq_n_s32(0), sum1 = vdupq_n_s32(0);
+    // Eight independent accumulators keep several multiply chains in flight
+    // and cap each lane at 32 products, far from the int32 limit.
+    int32x4_t sum[8];
+    for (int s = 0; s < 8; ++s) sum[s] = vdupq_n_s32(0);
     const int16x8_t zero = vdupq_n_s16(0);
     const int16x8_t maxValue = vdupq_n_s16((int16_t)QA);
-    for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-        for (int j = 0; j < 2; ++j) {
+    for (int i = 0; i < HIDDEN_SIZE; i += 32) {
+        for (int j = 0; j < 4; ++j) {
             const int k = i + 8 * j;
             const int16x8_t a = vminq_s16(vmaxq_s16(vld1q_s16(us + k), zero), maxValue);
             const int16x8_t b = vminq_s16(vmaxq_s16(vld1q_s16(them + k), zero), maxValue);
@@ -270,19 +290,21 @@ int infer(const Accumulator& acc, int stm) {
             const int16x8_t wb = vld1q_s16(network->outputWeights[1] + k);
             const int16x8_t pa = vmulq_s16(a, wa);
             const int16x8_t pb = vmulq_s16(b, wb);
-            int32x4_t& s = j ? sum1 : sum0;
-            s = vmlal_s16(s, vget_low_s16(pa), vget_low_s16(a));
-            s = vmlal_s16(s, vget_high_s16(pa), vget_high_s16(a));
-            s = vmlal_s16(s, vget_low_s16(pb), vget_low_s16(b));
-            s = vmlal_s16(s, vget_high_s16(pb), vget_high_s16(b));
+            int32x4_t& sa = sum[2 * j];
+            int32x4_t& sb = sum[2 * j + 1];
+            sa = vmlal_s16(sa, vget_low_s16(pa), vget_low_s16(a));
+            sa = vmlal_s16(sa, vget_high_s16(pa), vget_high_s16(a));
+            sb = vmlal_s16(sb, vget_low_s16(pb), vget_low_s16(b));
+            sb = vmlal_s16(sb, vget_high_s16(pb), vget_high_s16(b));
         }
     }
-    const int32x4_t sum = vaddq_s32(sum0, sum1);
+    int32x4_t sumAll = vaddq_s32(vaddq_s32(vaddq_s32(sum[0], sum[1]), vaddq_s32(sum[2], sum[3])),
+                                 vaddq_s32(vaddq_s32(sum[4], sum[5]), vaddq_s32(sum[6], sum[7])));
 #if defined(__aarch64__)
-    total += vaddvq_s32(sum);
+    total += vaddvq_s32(sumAll);
 #else
     alignas(16) int32_t lanes[4];
-    vst1q_s32(lanes, sum);
+    vst1q_s32(lanes, sumAll);
     for (int lane : lanes) total += lane;
 #endif
 #else
@@ -373,71 +395,154 @@ bool select(int slot) {
 
 bool available() { return network != nullptr; }
 
-// Apply one change to both perspectives in a single pass. The two rows and the
-// two accumulator streams are independent, so interleaving them keeps twice as
-// much work in flight as two separate passes while still writing each
-// accumulator exactly once. (Measured: bench 12 goes from ~327 ms to ~299 ms
-// with identical node counts.)
-void update_row2(int16_t* dstA, int16_t* dstB, const int16_t* rowA, const int16_t* rowB, bool add) {
+// Apply every add and sub of one move to both perspectives in a single pass:
+// load the source accumulator once, apply the changed feature rows, store the
+// destination once. A quiet move changes two features, a capture three, a
+// castle four, so the old per-feature loop streamed the accumulator two to four
+// times per move. The add-then-sub order matches Patricia's update kernel (MIT),
+// whose networks this engine uses. dst may alias src.
+template <int NA, int NS>
+inline void update_rows(int16_t* dstA, int16_t* dstB,
+                        const int16_t* srcA, const int16_t* srcB,
+                        const int16_t* const* addA, const int16_t* const* subA,
+                        const int16_t* const* addB, const int16_t* const* subB) {
 #if defined(WALLE_X86_AVX2_DISPATCH)
     if (have_avx2()) {
-        update_row2_avx2(dstA, dstB, rowA, rowB, add);
+        update_rows_avx2<NA, NS>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
         return;
     }
 #endif
 #if defined(__AVX512BW__) && defined(__AVX512F__)
     for (int i = 0; i < HIDDEN_SIZE; i += 32) {
-        const __m512i wA = _mm512_load_si512(reinterpret_cast<const __m512i*>(rowA + i));
-        const __m512i wB = _mm512_load_si512(reinterpret_cast<const __m512i*>(rowB + i));
-        const __m512i vA = _mm512_load_si512(reinterpret_cast<const __m512i*>(dstA + i));
-        const __m512i vB = _mm512_load_si512(reinterpret_cast<const __m512i*>(dstB + i));
-        _mm512_store_si512(reinterpret_cast<__m512i*>(dstA + i),
-                           add ? _mm512_adds_epi16(vA, wA) : _mm512_subs_epi16(vA, wA));
-        _mm512_store_si512(reinterpret_cast<__m512i*>(dstB + i),
-                           add ? _mm512_adds_epi16(vB, wB) : _mm512_subs_epi16(vB, wB));
+        __m512i vA = _mm512_load_si512(reinterpret_cast<const __m512i*>(srcA + i));
+        __m512i vB = _mm512_load_si512(reinterpret_cast<const __m512i*>(srcB + i));
+        for (int a = 0; a < NA; ++a) {
+            vA = _mm512_adds_epi16(vA, _mm512_load_si512(reinterpret_cast<const __m512i*>(addA[a] + i)));
+            vB = _mm512_adds_epi16(vB, _mm512_load_si512(reinterpret_cast<const __m512i*>(addB[a] + i)));
+        }
+        for (int s = 0; s < NS; ++s) {
+            vA = _mm512_subs_epi16(vA, _mm512_load_si512(reinterpret_cast<const __m512i*>(subA[s] + i)));
+            vB = _mm512_subs_epi16(vB, _mm512_load_si512(reinterpret_cast<const __m512i*>(subB[s] + i)));
+        }
+        _mm512_store_si512(reinterpret_cast<__m512i*>(dstA + i), vA);
+        _mm512_store_si512(reinterpret_cast<__m512i*>(dstB + i), vB);
     }
 #elif defined(__AVX2__)
     for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-        const __m256i wA = _mm256_load_si256(reinterpret_cast<const __m256i*>(rowA + i));
-        const __m256i wB = _mm256_load_si256(reinterpret_cast<const __m256i*>(rowB + i));
-        const __m256i vA = _mm256_load_si256(reinterpret_cast<const __m256i*>(dstA + i));
-        const __m256i vB = _mm256_load_si256(reinterpret_cast<const __m256i*>(dstB + i));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(dstA + i),
-                           add ? _mm256_adds_epi16(vA, wA) : _mm256_subs_epi16(vA, wA));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(dstB + i),
-                           add ? _mm256_adds_epi16(vB, wB) : _mm256_subs_epi16(vB, wB));
+        __m256i vA = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcA + i));
+        __m256i vB = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcB + i));
+        for (int a = 0; a < NA; ++a) {
+            vA = _mm256_adds_epi16(vA, _mm256_load_si256(reinterpret_cast<const __m256i*>(addA[a] + i)));
+            vB = _mm256_adds_epi16(vB, _mm256_load_si256(reinterpret_cast<const __m256i*>(addB[a] + i)));
+        }
+        for (int s = 0; s < NS; ++s) {
+            vA = _mm256_subs_epi16(vA, _mm256_load_si256(reinterpret_cast<const __m256i*>(subA[s] + i)));
+            vB = _mm256_subs_epi16(vB, _mm256_load_si256(reinterpret_cast<const __m256i*>(subB[s] + i)));
+        }
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dstA + i), vA);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dstB + i), vB);
     }
 #elif defined(WALLE_NEON)
     for (int i = 0; i < HIDDEN_SIZE; i += 16) {
-        const int16x8_t wA0 = vld1q_s16(rowA + i),      wA1 = vld1q_s16(rowA + i + 8);
-        const int16x8_t wB0 = vld1q_s16(rowB + i),      wB1 = vld1q_s16(rowB + i + 8);
-        const int16x8_t vA0 = vld1q_s16(dstA + i),      vA1 = vld1q_s16(dstA + i + 8);
-        const int16x8_t vB0 = vld1q_s16(dstB + i),      vB1 = vld1q_s16(dstB + i + 8);
-        vst1q_s16(dstA + i,     add ? vqaddq_s16(vA0, wA0) : vqsubq_s16(vA0, wA0));
-        vst1q_s16(dstA + i + 8, add ? vqaddq_s16(vA1, wA1) : vqsubq_s16(vA1, wA1));
-        vst1q_s16(dstB + i,     add ? vqaddq_s16(vB0, wB0) : vqsubq_s16(vB0, wB0));
-        vst1q_s16(dstB + i + 8, add ? vqaddq_s16(vB1, wB1) : vqsubq_s16(vB1, wB1));
+        int16x8_t vA0 = vld1q_s16(srcA + i),     vA1 = vld1q_s16(srcA + i + 8);
+        int16x8_t vB0 = vld1q_s16(srcB + i),     vB1 = vld1q_s16(srcB + i + 8);
+        for (int a = 0; a < NA; ++a) {
+            vA0 = vqaddq_s16(vA0, vld1q_s16(addA[a] + i));
+            vA1 = vqaddq_s16(vA1, vld1q_s16(addA[a] + i + 8));
+            vB0 = vqaddq_s16(vB0, vld1q_s16(addB[a] + i));
+            vB1 = vqaddq_s16(vB1, vld1q_s16(addB[a] + i + 8));
+        }
+        for (int s = 0; s < NS; ++s) {
+            vA0 = vqsubq_s16(vA0, vld1q_s16(subA[s] + i));
+            vA1 = vqsubq_s16(vA1, vld1q_s16(subA[s] + i + 8));
+            vB0 = vqsubq_s16(vB0, vld1q_s16(subB[s] + i));
+            vB1 = vqsubq_s16(vB1, vld1q_s16(subB[s] + i + 8));
+        }
+        vst1q_s16(dstA + i, vA0);
+        vst1q_s16(dstA + i + 8, vA1);
+        vst1q_s16(dstB + i, vB0);
+        vst1q_s16(dstB + i + 8, vB1);
     }
 #else
-    const int sign = add ? 1 : -1;
     for (int i = 0; i < HIDDEN_SIZE; ++i) {
-        dstA[i] = static_cast<int16_t>(std::clamp(static_cast<int>(dstA[i]) + sign * rowA[i], -32768, 32767));
-        dstB[i] = static_cast<int16_t>(std::clamp(static_cast<int>(dstB[i]) + sign * rowB[i], -32768, 32767));
+        int vA = srcA[i], vB = srcB[i];
+        for (int a = 0; a < NA; ++a) {
+            vA = std::clamp(vA + addA[a][i], -32768, 32767);
+            vB = std::clamp(vB + addB[a][i], -32768, 32767);
+        }
+        for (int s = 0; s < NS; ++s) {
+            vA = std::clamp(vA - subA[s][i], -32768, 32767);
+            vB = std::clamp(vB - subB[s][i], -32768, 32767);
+        }
+        dstA[i] = static_cast<int16_t>(vA);
+        dstB[i] = static_cast<int16_t>(vB);
     }
 #endif
 }
 
-void apply_changes(Accumulator& acc, const PieceChange* changes, int count) {
-    if (!network || count <= 0) return;
-    for (int change = 0; change < count; ++change) {
-        const PieceChange& piece = changes[change];
-        if (piece.type < 1 || piece.type > 6 || piece.square < 0 || piece.square >= 64) continue;
-        const int pc = (piece.color << 3) | piece.type;
-        update_row2(acc.values[0], acc.values[1],
-                    network->featureWeights[feature_index(pc, piece.square, 0)],
-                    network->featureWeights[feature_index(pc, piece.square, 1)],
-                    piece.add);
+inline const int16_t* update_row_for(const PieceChange& piece, int perspective) {
+    const int pc = (piece.color << 3) | piece.type;
+    return network->featureWeights[feature_index(pc, piece.square, perspective)];
+}
+
+void apply_update(Accumulator& dst, const Accumulator& src, const Update& update) {
+    if (!network) return;
+    if (update.adds == 0 && update.subs == 0) {
+        if (&dst != &src) dst = src;
+        return;
     }
+
+    const int16_t* addA[2] = {nullptr, nullptr};
+    const int16_t* subA[2] = {nullptr, nullptr};
+    const int16_t* addB[2] = {nullptr, nullptr};
+    const int16_t* subB[2] = {nullptr, nullptr};
+    for (int i = 0; i < update.adds; ++i) {
+        addA[i] = update_row_for(update.add[i], 0);
+        addB[i] = update_row_for(update.add[i], 1);
+    }
+    for (int i = 0; i < update.subs; ++i) {
+        subA[i] = update_row_for(update.sub[i], 0);
+        subB[i] = update_row_for(update.sub[i], 1);
+    }
+
+    const int16_t* srcA = src.values[0];
+    const int16_t* srcB = src.values[1];
+    int16_t* dstA = dst.values[0];
+    int16_t* dstB = dst.values[1];
+    if (update.adds == 0) {
+        if (update.subs == 1) update_rows<0, 1>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
+        else                  update_rows<0, 2>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
+    } else if (update.adds == 1) {
+        if (update.subs == 1) update_rows<1, 1>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
+        else                  update_rows<1, 2>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
+    } else {
+        if (update.subs == 1) update_rows<2, 1>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
+        else                  update_rows<2, 2>(dstA, dstB, srcA, srcB, addA, subA, addB, subB);
+    }
+}
+
+void revert_update(Accumulator& dst, const Accumulator& src, const Update& update) {
+    if (!network) return;
+    Update inverse;
+    for (int i = 0; i < update.adds; ++i) inverse.subPiece(update.add[i].color, update.add[i].type, update.add[i].square);
+    for (int i = 0; i < update.subs; ++i) inverse.addPiece(update.sub[i].color, update.sub[i].type, update.sub[i].square);
+    apply_update(dst, src, inverse);
+}
+
+void prefetch_update(const Update& update) {
+    if (!network) return;
+#if defined(__GNUC__) || defined(__clang__)
+    for (int i = 0; i < update.adds; ++i) {
+        __builtin_prefetch(update_row_for(update.add[i], 0), 0, 3);
+        __builtin_prefetch(update_row_for(update.add[i], 1), 0, 3);
+    }
+    for (int i = 0; i < update.subs; ++i) {
+        __builtin_prefetch(update_row_for(update.sub[i], 0), 0, 3);
+        __builtin_prefetch(update_row_for(update.sub[i], 1), 0, 3);
+    }
+#else
+    (void)update;
+#endif
 }
 
 void reset(Accumulator& acc, const uint8_t board[64]) {
