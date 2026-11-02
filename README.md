@@ -5,7 +5,7 @@ stack, Lazy SMP and **incremental NNUE** evaluation. It builds to one statically
 `chess.exe` with no runtime dependencies, and the evaluation network is compiled into the
 executable.
 
-**Download:** [Wall-E v1.1.2](https://github.com/Tianl1234/Wall-e/releases/tag/v1.1.2) — a single
+**Download:** [Wall-E v1.4.0](https://github.com/Tianl1234/Wall-e/releases/tag/v1.4.0) — a single
 self-contained `chess.exe` with the NNUE network embedded. The engine reports itself as
 `Wall-E 2` over UCI.
 
@@ -51,15 +51,16 @@ single thread, shipped binary, NNUE evaluation active):
 
 | Test | Result |
 |---|---|
-| bench — 6 standard positions, depth 12 | 852,295 nodes in 342 ms (**2.49 Mnps**) |
-| startpos → depth 18 | 1,092 ms, 2,988,534 nodes (**2.74 Mnps**) |
-| perft(6) from startpos | 119,060,324 nodes in 1.93 s (**~62 Mnps**) |
+| bench — 6 standard positions, depth 12 | 797,013 nodes in 309 ms (**2.58 Mnps**) |
+| bench — depth 16 | 6,929,453 nodes in 2.72 s (**2.54 Mnps**) |
+| startpos → depth 18 | 1,131 ms, 3,224,082 nodes (**2.85 Mnps**) |
+| perft(6) from startpos | 119,060,324 nodes in 1.82 s (**~65 Mnps**) |
 | perft positions checked (startpos, Kiwipete, position 3) | all match the reference node counts |
 | incremental state self-test (`verify`) | zero Zobrist / material / PSQT / NNUE mismatches |
 
-These figures are from v1.1.2, which restores NNUE evaluation. The v1.1.0/v1.1.1 numbers were
-taken with the network rejected and are not comparable. The engine does not quote an Elo
-estimate: a controlled match against a rated engine is the next step before claiming a rating.
+These figures are from v1.4.0. The v1.1.0/v1.1.1 numbers were taken with the network rejected
+and are not comparable. The engine does not quote an Elo estimate: a controlled match against a
+rated engine is the next step before claiming a rating.
 
 ## Search
 
@@ -130,6 +131,35 @@ without it, replace `_pext_u64` with the magic-bitboard path.
 
 Add `chess.exe` as a UCI engine in En Croissant, Arena, Cute Chess or BanksiaGUI. Nothing else
 is needed — the network travels inside the executable.
+
+## Changes in v1.4.0
+
+Review pass over the desktop engine. Fixes:
+
+* **TT replacement could overwrite the wrong entry** — the victim-selection loop compared each
+  candidate against a slot that was reassigned inside the loop, so fresh, deep entries could be
+  dropped while old, shallow ones survived
+* **stale root continuation history** — ply 1 read the counter-move and continuation-history key
+  from an old root move; the root move is now stored before the child search
+* **Lazy SMP helpers searched at a fixed depth** instead of climbing with the main thread; they
+  now run the same iterative-deepening loop, which noticeably improves multi-thread depth
+* **a failed NNUE reload removed the working evaluator** — a bad `setoption name EvalFile` left
+  the engine with no network; the previous network is now kept until the replacement passes the
+  sanity probe
+* **movetime left 40% of the budget unused** — the soft limit is now 90% of the allotted time
+  (still inside the hard limit)
+
+Speed:
+
+* SEE is iterative instead of recursive (used by move ordering and SEE pruning)
+* transposition-table bucket prefetch at node entry
+* the shared node counter is only updated atomically when a node limit is set; normal search
+  uses plain per-thread counters, summed for `info nodes`
+
+Measured against the previous build: **2.56 vs 2.51 Mnps** on the short bench, **~2.6% fewer
+nodes** at equal depth on the 6-position bench, and **depth 20 vs 18** with 4 threads at 3 s.
+Perft, `verify 4` (zero inconsistencies), fixed-depth move comparison, self-play and the
+rejected-network test all pass on the shipped binary.
 
 ## Changes in v1.1.2
 

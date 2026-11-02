@@ -45,12 +45,16 @@ bool parse_network(const int16_t* raw, const char* label) {
         for (int16_t weight : perspective)
             if (weight < -128 || weight > 128) return false;
 
+    // Keep the currently loaded network until the replacement has passed the
+    // sanity checks, so a bad EvalFile does not silently leave the engine
+    // without any evaluator (the UCI layer reports that it retains the old one).
+    std::unique_ptr<Network> previous = std::move(network);
     network = std::move(candidate);
     // A network whose material ordering is nonsense, or that does not match
     // this code's feature layout, would silently ruin every evaluation.
     // Reject it so the caller can fall back to the handcrafted evaluation.
     if (!network_sane()) {
-        network.reset();
+        network = std::move(previous);
         std::cerr << "info string NNUE: " << label
                   << " fails material sanity checks; rejected\n";
         return false;

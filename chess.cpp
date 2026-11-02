@@ -740,46 +740,62 @@ static inline void gen_all(const Position& p, MoveList& ml) {
 // ---------------------------------------------------------------------------
 constexpr int SEE_VAL[7] = {0, 100, 320, 330, 500, 950, 20000};
 
-static int see_rec(const Position& p, int to, int side, int target, U64 occ) {
-    U64 att = attackers_to(p, to, occ) & p.occ[side] & occ;
-    int pt;
-    U64 bb = 0;
-    for (pt = PAWN; pt <= KING; ++pt) {
-        bb = att & p.bb[make_pc(side, pt)];
-        if (bb) break;
-    }
-    if (!bb) return 0;
-    U64 nb = bb & (~bb + 1);
-    U64 occ2 = occ ^ nb;
-    if (pt == KING) {
-        if (attackers_to(p, to, occ2) & p.occ[side ^ 1] & occ2) return 0;
-    }
-    int reply = see_rec(p, to, side ^ 1, SEE_VAL[pt], occ2);
-    return std::max(0, target - reply);
-}
+// Static exchange evaluation with a threshold: does move m win at least
+// `threshold`? Walks the least-valuable-attacker recapture sequence, then
+// evaluates it back-to-front (either side may decline a losing recapture).
+// Two bounds short-circuit most calls immediately: the exchange can never win
+// more than the first victim, and never lose more than the moving piece on top
+// of it. The iterative form is considerably cheaper than a recursive one.
+bool see_ge(const Position& p, uint16_t m, int threshold) {
+    const int from = mv_from(m), to = mv_to(m), mt = mv_type(m);
+    const int us = p.stm;
 
-int see_value(const Position& p, uint16_t m) {
-    const int mt = mv_type(m);
-    if (!is_capture(mt)) {
-        if (is_promo(mt)) return SEE_VAL[promo_type(mt)] - SEE_VAL[PAWN];
-        return 0;
-    }
-    const int from = mv_from(m), to = mv_to(m);
-    const int us = p.stm, them = us ^ 1;
-    int gain = SEE_VAL[pc_type(mt == MT_EP ? make_pc(them, PAWN) : p.sq[to])];
-    int ourVal = SEE_VAL[pc_type(p.sq[from])];
-    if (is_promo(mt)) {
-        gain += SEE_VAL[promo_type(mt)] - SEE_VAL[PAWN];
-        ourVal = SEE_VAL[promo_type(mt)];
-    }
+    // By convention a non-capturing, non-promoting move has a SEE of zero:
+    // the opponent does not get a free recapture on it.
+    if (!is_capture(mt) && !is_promo(mt)) return threshold <= 0;
+
+    const int c0 = SEE_VAL[(mt == MT_EP) ? PAWN : pc_type(p.sq[to])]
+                 + (is_promo(mt) ? SEE_VAL[promo_type(mt)] - SEE_VAL[PAWN] : 0);
+    if (c0 < threshold) return false;
+
+    const int a0 = is_promo(mt) ? promo_type(mt) : pc_type(p.sq[from]);
+    if (c0 - SEE_VAL[a0] >= threshold) return true;
+
     U64 occ = p.all ^ bit(from);
     if (mt == MT_EP) occ ^= bit(us == WHITE ? to - 8 : to + 8);
-    else occ ^= bit(to);
-    return gain - see_rec(p, to, them, ourVal, occ);
-}
+    else             occ ^= bit(to);
 
-inline bool see_ge(const Position& p, uint16_t m, int threshold) {
-    return see_value(p, m) >= threshold;
+    // vals[k] = piece type of the k-th piece to land on the square:
+    // vals[0] is the mover, vals[1] their cheapest recapturer, ...
+    int vals[32];
+    int n = 1;
+    vals[0] = a0;
+    int side = us ^ 1;
+    while (n < 32) {
+        U64 att = attackers_to(p, to, occ) & occ & p.occ[side];
+        if (!att) break;
+        int pt;
+        U64 b = 0;
+        for (pt = PAWN; pt <= KING; ++pt) {
+            b = att & p.bb[make_pc(side, pt)];
+            if (b) break;
+        }
+        if (pt == KING) {
+            // a king may only recapture into an otherwise undefended square;
+            // if the square stays defended, this side has to stop here
+            U64 occ2 = occ ^ (b & (0 - b));
+            if (attackers_to(p, to, occ2) & occ2 & p.occ[side ^ 1]) break;
+        }
+        vals[n++] = pt;
+        occ ^= b & (0 - b);
+        side ^= 1;
+    }
+
+    // f = value of the remaining recapture sequence for the side to move
+    int f = 0;
+    for (int k = n - 1; k >= 1; --k)
+        f = std::max(0, SEE_VAL[vals[k - 1]] - f);
+    return c0 - f >= threshold;
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1033,12 @@ struct TT {
     void clear() { std::fill(t.begin(), t.end(), TTEntry{}); }
     inline TTEntry* bucket(U64 key) { return &t[(key & bucketMask) * 4]; }
 
+    // Start the cache-line load early: the probe is the first heavy memory
+    // access of every node once the table outgrows the caches.
+    inline void prefetch(U64 key) {
+        if (!t.empty()) __builtin_prefetch(bucket(key), 0, 3);
+    }
+
     inline bool probe(U64 key, uint16_t& mv, int& score, int& depth, int& bound) {
         if (t.empty()) return false;
         TTEntry* b = bucket(key);
@@ -1041,9 +1063,14 @@ struct TT {
         if (!slot) {
             slot = &b[0];
             for (int i = 1; i < 4; ++i) {
-                int si = (slot->genBound >> 2), bi2 = (b[i].genBound >> 2);
-                if (bi2 != gen && si == gen) slot = &b[i];
-                else if (bi2 == si && b[i].depth < slot->depth) slot = &b[i];
+                const int slotGen = slot->genBound >> 2;
+                const int entryGen = b[i].genBound >> 2;
+                if (entryGen != slotGen) {
+                    if (slotGen == gen) continue;          // keep a current-generation entry
+                    if (entryGen == gen) slot = &b[i];     // else prefer the current generation
+                } else if (b[i].depth < slot->depth) {
+                    slot = &b[i];                          // same generation: replace shallower
+                }
             }
         } else {
             if (slot->depth > depth + 2 && bound != BOUND_EXACT) return;
@@ -1052,7 +1079,9 @@ struct TT {
         slot->key = key;
         slot->value = (int16_t)score;
         slot->move = mv;
-        slot->depth = (int8_t)depth;
+        // depth is a signed byte: `go depth` values above 127 would wrap around
+        // negative and poison every later probe of that entry.
+        slot->depth = (int8_t)std::min(depth, 126);
         slot->genBound = (uint8_t)((gen << 2) | bound);
     }
 
@@ -1169,10 +1198,10 @@ inline bool enter_node(ThreadData& T) {
             g_stop.store(true, std::memory_order_relaxed);
             return false;
         }
-    } else {
-        g_searchNodes.fetch_add(1, std::memory_order_relaxed);
     }
-
+    // Outside `go nodes` the shared counter is not needed: the info line adds
+    // up the per-thread counts. That keeps a locked read-modify-write out of
+    // the per-node hot path.
     ++T.nodes;
     if (T.id == 0 && (T.nodes & 1023) == 0 && check_stop(T)) return false;
     return true;
@@ -1295,6 +1324,8 @@ int negamax(ThreadData& T, Position& pos, int depth, int alpha, int beta, int pl
     if (!enter_node(T)) return 0;
     if (ply > T.seldepth) T.seldepth = ply;
     if (ply >= MAX_PLY - 2) return evaluate(pos);
+
+    tt.prefetch(pos.key);
 
     const bool chk = in_check(pos);
     if (chk) depth++;
@@ -1620,6 +1651,9 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
                 const int movedPc = pos.sq[mv_from(rm[i].m)];
                 Undo u;
                 make_move(pos, rm[i].m, u);
+                // ply 1 derives its counter-move and continuation-history keys
+                // from the root move; without this it reads a stale slot.
+                T.moveStack[0] = rm[i].m;
                 int sc;
                 if (i == 0) {
                     sc = -negamax(T, pos, d - 1, -beta, -a, 1, false);
@@ -1658,7 +1692,8 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
 
         if (mainThread) {
             int64_t ms = elapsed_ms();
-            U64 nodes = g_searchNodes.load(std::memory_order_relaxed);
+            U64 nodes = 0;
+            for (const ThreadData* worker : threads) nodes += worker->nodes;
             U64 nps = ms ? (nodes * 1000ULL / (U64)ms) : 0;
             std::cout << "info depth " << d
                       << " seldepth " << T.seldepth
@@ -1680,13 +1715,11 @@ void iterate(ThreadData& T, int maxDepth, bool mainThread, int startDepth = 1) {
 }
 
 void helper_main(ThreadData* T, int maxDepth) {
-    // iterate() already runs its own iterative-deepening loop, so drive it one
-    // depth at a time instead of restarting from depth 1 on every iteration.
-    // The id & 1 offset gives the helper threads a small diversity gap.
-    for (int d = 1 + (T->id & 1); d <= maxDepth; ++d) {
-        if (g_stop.load(std::memory_order_relaxed)) break;
-        iterate(*T, d, false, d);
-    }
+    // Run the same iterative-deepening loop as the main thread: keeping the
+    // root ordering and aspiration windows between depths is what lets the
+    // helpers reuse the shared TT and contribute useful work. Restarting a
+    // one-depth search from scratch at every depth loses that ordering.
+    iterate(*T, maxDepth, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,7 +1913,9 @@ void apply_go_limits(const GoParams& gp, bool infinite) {
     if (gp.movetime > 0) {
         const int64_t hard = std::max<int64_t>(1, gp.movetime - g_moveOverhead);
         g_lim.hard.store(hard, std::memory_order_relaxed);
-        g_lim.soft.store(std::max<int64_t>(1, hard * 6 / 10), std::memory_order_relaxed);
+        // A fixed movetime should be used, not 60% of it: stop starting new
+        // iterations only when the hard deadline is nearly reached.
+        g_lim.soft.store(std::max<int64_t>(1, hard * 9 / 10), std::memory_order_relaxed);
     } else if (!infinite && (gp.wtime > 0 || gp.btime > 0)) {
         int64_t myTime = (gp.stm == WHITE) ? gp.wtime : gp.btime;
         int64_t myInc  = (gp.stm == WHITE) ? gp.winc : gp.binc;
@@ -1941,6 +1976,7 @@ void start_search(int maxDepth) {
     if (threads.size() > 1) {
         for (size_t i = 1; i < threads.size(); ++i) threads[i]->pos = threads[0]->pos;
     }
+    for (auto* T : threads) T->nodes = 0;
 
     g_searching.store(true);
     searchThread = std::thread([maxDepth]() {
