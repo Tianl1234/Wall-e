@@ -65,11 +65,11 @@ depth-15 search trace and best move, because the AVX2 kernels use the same
 saturating int16 arithmetic. The old 1.3.2 x86_64 library contained no AVX2
 instructions; the 1.3.3 library contains the kernels and the guarded dispatch.
 
-Two packages are attached to the release:
+Two packages are attached to the release (same files under versioned names in `apk/`):
 
-- `Wall-E-engine-1.3.3.apk` — `com.tianl1234.walle`, one network (fingolfin), ~2.2 MB.
-- `Wall-E-engine-1.3.3-strong.apk` — `com.tianl1234.walle.strong`, three phase
-  networks (fingolfin/finarfin/feanor), ~5.9 MB.
+- `wall-e.tiny.apk` — `com.tianl1234.walle`, one network (fingolfin), ~2.2 MB.
+- `wall-e.strong.apk` — `com.tianl1234.walle.strong`, three phase networks
+  (fingolfin/finarfin/feanor), ~5.9 MB.
 
 Both are versionCode 8 / versionName 1.3.3, signed with the same key as earlier
 releases and upgrade in place. The change does not affect ARM phones: they
