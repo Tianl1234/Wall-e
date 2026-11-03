@@ -52,14 +52,14 @@ case "$VARIANT" in
     tiny)
         APP_ID="com.tianl1234.walle"
         APP_LABEL="Wall-E Chess Engine"
-        ENGINE_NAME="Wall-E 1.3.5"
+        ENGINE_NAME="Wall-E 1.3.6"
         EXTRA_CXXFLAGS=()
         APK_NAME="wall-e.tiny.apk"
         ;;
     strong)
         APP_ID="com.tianl1234.walle.strong"
         APP_LABEL="Wall-E Chess Engine (Strong)"
-        ENGINE_NAME="Wall-E 1.3.5 Strong"
+        ENGINE_NAME="Wall-E 1.3.6 Strong"
         EXTRA_CXXFLAGS=(-DWALLE_PHASE_NETS)
         APK_NAME="wall-e.strong.apk"
         ;;

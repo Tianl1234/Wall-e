@@ -42,7 +42,7 @@ copied from working engine APKs rather than invented:
 
 ```xml
 <enginelist>
-    <engine name="Wall-E 1.3.5" filename="libwalle.so" target="arm64-v8a|x86_64" />
+    <engine name="Wall-E 1.3.6" filename="libwalle.so" target="arm64-v8a|x86_64" />
 </enginelist>
 ```
 
@@ -66,18 +66,25 @@ info string NNUE loaded: <embedded network>
 If instead it says `NNUE unavailable`, the network was not linked — the engine still
 plays, but with the weaker handcrafted evaluation.
 
+The strong package embeds three networks (`fingolfin`, `finarfin`, `feanor`) and reports
+`+ finarfin + feanor` in the same line. Since 1.3.6 it evaluates with fingolfin and
+switches to finarfin only in endgames (half the material or less); feanor is embedded but
+no longer selected automatically, because its noise showed up in GUI evaluation bars
+during opening analysis. The choice is made once per `go` and the transposition table is
+cleared when the active network changes.
+
 ## Using it
 
 1. Install `build/wall-e.tiny.apk` (one network) or `build/wall-e.strong.apk` (three phase
    networks, larger). It will not appear in the launcher — by design.
 2. In a GUI that supports OEX engines (Chess for Android, Chessis, and other
    kalab-based GUIs), open the engine menu and **import/select an engine**.
-3. Pick **Wall-E 1.3.5** from the list.
+3. Pick **Wall-E 1.3.6** from the list.
 
 For Chess for Android specifically: long-press the notation window → *UCI and XBoard* →
-*Import engine* → *Wall-E 1.3.5*. No SD-card import step is needed.
+*Import engine* → *Wall-E 1.3.6*. No SD-card import step is needed.
 
-The APK upgrades the previous engine package in place (`versionCode 10`, same signing
+The APK upgrades the previous engine package in place (`versionCode 11`, same signing
 key), so the old icon disappears when you install it.
 
 Both packages default to `Threads=2` because phone GUIs rarely change engine options;
@@ -122,16 +129,16 @@ Build with `android/build_apk.sh` and refresh the results below after a successf
 | Check | Result |
 |---|---|
 | Launcher entry | none — `aapt2 dump badging` shows no `launchable-activity`, `application: icon=''`; build script enforces it |
-| Manifest | `com.tianl1234.walle`, versionCode 10 / versionName 1.3.5, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
-| OEX wiring | `intent.chess.provider.ENGINE`, `chess.provider.engine.authority`, exported `EngineProvider`, `res/xml/enginelist.xml` present as `xml/enginelist` |
-| Native code | verify `arm64-v8a`, `x86_64`, ELF PIE alignment and no TEXTREL after build |
-| Embedded network | verify network presence in both newly built binaries after build |
-| Signature | verify with `apksigner` after build |
-| Loader/update checks | rerun host perft and bench after the v1.3.5 update before citing measurements |
-| APK contents | verify contents after build |
-| Install (WSA) | tiny and strong APKs install on Windows Subsystem for Android 13 (x86_64), versionCode 10 / versionName 1.3.5, `primaryCpuAbi=x86_64`; the OEX query resolves `com.tianl1234.walle/.EngineActivity` |
-| Runtime (WSA) | extracted `libwalle.so` executes from `nativeLibraryDir`-equivalent path: `perft 5` = 4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes in 197–199 ms (~2.8 Mnps), `Threads=4` depth-16 search completes |
-| Phase nets (WSA) | strong APK reports `NNUE loaded: <embedded network> + finarfin + feanor`; middlegame and endgame positions search cleanly across a phase switch (TT cleared, fresh node counts) |
+| Manifest | `com.tianl1234.walle`, versionCode 11 / versionName 1.3.6, minSdk 26, targetSdk 34, `extractNativeLibs=true` |
+| OEX wiring | `intent.chess.provider.ENGINE`, `chess.provider.engine.authority`, exported `EngineProvider`, `res/xml/enginelist.xml` present as `xml/enginelist`, name `Wall-E 1.3.6` |
+| Native code (1.3.6) | both ABIs `ET_DYN` PIE, LOAD alignment 16 KiB, no TEXTREL, only `libc`/`libm`/`libdl` needed |
+| Embedded network (1.3.6) | byte-for-byte identical to `nnue/*.nnue`: fingolfin in both tiny libraries; fingolfin, finarfin and feanor in both strong libraries |
+| Signature (1.3.6) | `apksigner` verifies v2 + v3 with the existing Wall-E key |
+| Loader/update checks (1.3.6) | host build from the same sources: `perft 5` = 4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes |
+| APK contents (1.3.6) | manifest, `res/xml/enginelist.xml`, `classes.dex`, `lib/arm64-v8a`, `lib/x86_64`; `zipalign -c -p 4` passes |
+| Install (WSA) | 1.3.5 packages installed on Windows Subsystem for Android 13 (x86_64), `primaryCpuAbi=x86_64`, and the OEX query resolved `com.tianl1234.walle/.EngineActivity`; 1.3.6 packaging was verified on the host because WSA's adb endpoint was not available at build time |
+| Runtime (WSA, 1.3.5) | extracted `libwalle.so` executes from `nativeLibraryDir`-equivalent path: `perft 5` = 4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes in 197–199 ms (~2.8 Mnps), `Threads=4` depth-16 search completes |
+| Phase nets (1.3.6) | host build with the APK's sources: start position and 16-point middlegame auto-select fingolfin and match pinned-fingolfin scores; 12-point endgame auto-selects finarfin and matches pinned-finarfin; strong build embeds all three |
 
 **Not checked:** the ARM64 package has still not run on ARM hardware. WSA is x86_64 and
 therefore exercises only the x86_64 build (SSE4.2 baseline with runtime AVX2), not the

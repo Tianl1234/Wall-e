@@ -2110,8 +2110,14 @@ bool g_phaseNets = true;
 int g_phaseSlot = Nnue::MIDDLEGAME_NET;
 
 int phase_slot(int phaseInc) {
-    if (phaseInc <= 8) return Nnue::ENDGAME_NET;      // finarfin
-    if (phaseInc >= 19) return Nnue::AGGRESSIVE_NET;  // feanor
+    // fingolfin is the strongest general-purpose net. finarfin takes over only
+    // in low-material endings; feanor is trained for speculative attacks, scores
+    // noisier and measured weaker in equal play, so it is not selected
+    // automatically; the strong package still embeds it.
+    //
+    // A full board has phaseInc 24, so <= 12 means half the material or less is
+    // left. Patricia switches to its endgame net at the same point.
+    if (phaseInc <= 12) return Nnue::ENDGAME_NET;     // finarfin
     return Nnue::MIDDLEGAME_NET;                      // fingolfin
 }
 #endif

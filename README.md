@@ -11,14 +11,14 @@ list. `android/README.md` documents the protocol and how to import it.
 
 ## Download
 
-- [wall-e.tiny.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.5-android/wall-e.tiny.apk)
+- [wall-e.tiny.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.6-android/wall-e.tiny.apk)
   — one network (fingolfin), 2.2 MB.
-- [wall-e.strong.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.5-android/wall-e.strong.apk)
+- [wall-e.strong.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.6-android/wall-e.strong.apk)
   — three phase networks (fingolfin/finarfin/feanor), 5.9 MB.
 
-Both are versionCode 10 / versionName 1.3.5, signed with the same key as earlier
+Both are versionCode 11 / versionName 1.3.6, signed with the same key as earlier
 releases and upgrade in place. The same files are kept under versioned names in `apk/`
-(`Wall-E-engine-1.3.5.apk` and `Wall-E-engine-1.3.5-strong.apk`).
+(`Wall-E-engine-1.3.6.apk` and `Wall-E-engine-1.3.6-strong.apk`).
 
 ## Layout
 
@@ -67,6 +67,33 @@ could not compile for a phone. Three changes fix that without touching the searc
    each perspective's int16 accumulator with saturating SIMD operations (NEON on ARM64),
    rather than allocating and reducing a two-perspective int32 delta buffer on each move.
 5. **PIE.** Android requires position-independent executables; the NDK build produces one.
+
+## Changes in 1.3.6
+
+This release removes the main reason the evaluation bar wandered while the strong package
+was analysing an opening position.
+
+- **Phase-network selection now matches desktop 1.5.0.** The strong package evaluates
+  with fingolfin everywhere and switches to finarfin only when at most half the material
+  is left (`phaseInc <= 12` of 24). Previously it selected feanor from `phaseInc >= 19`
+  upwards — that is almost every opening and middlegame position — and changed networks a
+  second time at 8.
+- **Why that mattered.** Feanor is trained for speculative attacks. Over 12 opening lines
+  its scores were systematically higher and moved more from depth to depth: 7 sign flips
+  and a 47.9 cp average maximum step from depth 8, against 5 and 34.7 cp for fingolfin
+  (finarfin was calmest, 0 and 20.8 cp). A GUI redraws the bar at every `info` line, so
+  the noisier net made the bar travel further between consecutive depths. Opening
+  analysis now uses the net that measured calmest among the general-purpose choices.
+- **Feanor is still embedded** in the strong package, but it is no longer chosen
+  automatically; a search that explicitly loads it with `EvalFile` still uses it. The
+  tiny package is unchanged: it only ever contained fingolfin.
+- **Checks on a host build from the same sources.** Start position and a 16-material-point
+  middlegame auto-select fingolfin and produce exactly the pinned-fingolfin scores; a
+  12-point endgame auto-selects finarfin and matches pinned-finarfin. `verify 4` =
+  197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes, `perft 5` = 4,865,609.
+
+The bar still follows the score as the search deepens, and a changing best move can move
+it; what this removes is the extra, network-induced swing during opening analysis.
 
 ## Changes in 1.3.5
 
@@ -203,10 +230,15 @@ could not compile for a phone. These changes fixed that without touching the sea
 
 ## Verification done here
 
-- Host build (`-march=znver5`): `perft 5` = 4,865,609, `verify 4` = 197,281 nodes with
-  0 inconsistent, `bench 12` = 556,713 nodes in ~155 ms (3.5 Mnps). Before the qsearch
-  table probe the same bench searched 665,358 nodes in ~164 ms, so the reduction costs
-  no strength: a 16-game 60 ms match between the two builds finished 7-7 with 4 draws.
+- Host build (`-march=znver5`, embedded networks, same sources as the APK): `perft 5` =
+  4,865,609, `verify 4` = 197,281 nodes with 0 inconsistent, `bench 12` = 556,713 nodes
+  in ~161 ms (3.5 Mnps). Before the qsearch table probe the same bench searched 665,358
+  nodes in ~164 ms, so the reduction costs no strength: a 16-game 60 ms match between the
+  two builds finished 7-7 with 4 draws.
+- Phase policy (1.3.6): start position and a 16-material-point middlegame auto-select
+  fingolfin and give exactly the pinned-fingolfin scores; a 12-point endgame auto-selects
+  finarfin and gives exactly the pinned-finarfin scores. The strong build loads all three
+  networks; the tiny build loads fingolfin.
 - Reference positions: Kiwipete perft(4) = 4,085,603, position 3 perft(5) = 674,624,
   position 4 perft(4) = 422,333, position 5 perft(4) = 2,103,487, position 6 perft(3) =
   89,890, all matching the published counts; `verify 3`/`verify 4` clean on the same
@@ -217,14 +249,18 @@ could not compile for a phone. These changes fixed that without touching the sea
   LOAD alignment 16 KiB, no text relocations, only `libc`/`libm`/`libdl` needed;
   the NEON kernels are present (`smull`/`smlal`, `sqadd`/`sqsub`, `addv`) and the
   network's bytes are inside the binary.
-- APK: versionCode 10 / versionName 1.3.5, minSdk 26, targetSdk 34,
+- APK (1.3.6): versionCode 11 / versionName 1.3.6, minSdk 26, targetSdk 34,
   `extractNativeLibs=true`, native code `arm64-v8a` + `x86_64`, **no launcher category**
-  (so no icon), OEX activity/provider/enginelist present, signature verifies (v2 + v3).
-- Installed and executed under Windows Subsystem for Android 13 (x86_64): `perft 5` =
-  4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent, `bench 12` = 556,713 nodes in
-  ~199 ms, a `Threads=4` depth-16 search completes, and the strong package loads all
-  three networks and searches across a phase switch. This exercises the x86_64 build,
-  not the ARM64 NEON path.
+  (so no icon), OEX activity/provider/enginelist present, `zipalign` and `apksigner`
+  verify (v2 + v3). The embedded networks were compared byte-for-byte with
+  `nnue/*.nnue`: fingolfin in both tiny binaries, all three nets in both strong binaries.
+- Windows Subsystem for Android 13 (x86_64) on the 1.3.5 build, carrying the same engine
+  and packaging: `perft 5` = 4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent,
+  `bench 12` = 556,713 nodes in ~199 ms, a `Threads=4` depth-16 search completes, and the
+  strong package loads all three networks and searches across a phase switch. This
+  exercises the x86_64 build, not the ARM64 NEON path. The 1.3.6 packages were not
+  re-run in WSA because its adb endpoint was unavailable at build time; their only engine
+  change is the phase policy verified on the host build above.
 
 Build the current APK with `android/build_apk.sh`; rerun native and package checks after
 changes before quoting updated performance or APK checksum results.
