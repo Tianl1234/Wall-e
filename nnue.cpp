@@ -35,6 +35,8 @@ struct alignas(64) Network {
     alignas(64) int16_t bias[HIDDEN_SIZE];
     alignas(64) int16_t outputWeights[2][HIDDEN_SIZE];
     int16_t outputBias;
+    // Half of the network's measured side-to-move bonus; subtracted by evaluate().
+    int tempoCorrection = 0;
 };
 std::unique_ptr<Network> owned[NUM_NETS];
 // The network the evaluation actually reads; points into owned[].
@@ -230,6 +232,19 @@ void update_row(int16_t* dst, const int16_t* row, bool add) {
 #endif
 }
 
+// The output layer has one weight row per perspective: row 0 weights the
+// accumulator of the side to move, row 1 the opponent's. Together they evaluate
+// "how good is this for the side to move", and the bundled networks put far more
+// into that side-to-move (initiative) term than real chess does: about +1.1 pawns
+// in the opening, measured on all three, against the +0.2 a normal evaluation
+// carries. Because negamax flips the sign of the score at every ply, that term
+// makes the value of a position depend on the parity of the search, so the score a
+// GUI draws swings by about a pawn from one depth to the next, and from one
+// reviewed move to the next, while the position itself stays the same.
+//
+// evaluate() therefore takes half of that term back, using the value the network
+// reports on a symmetric board as the measurement. infer() stays a plain, faithful
+// implementation of the network.
 int infer(const Accumulator& acc, int stm) {
 #if defined(WALLE_X86_AVX2_DISPATCH)
     if (have_avx2()) return infer_avx2(acc, stm);
@@ -359,6 +374,13 @@ bool network_sane() {
     if (val[1] <= val[0] || val[2] <= val[0]) return false;         // minors beat a pawn
     if (val[3] <= val[1] || val[3] <= val[2]) return false;         // a rook beats the minors
     if (val[4] <= val[3]) return false;                             // a queen beats a rook
+
+    // The probe board is symmetric, so `start` is exactly the bonus this network
+    // gives the side to move -- about a pawn for the bundled ones, several times
+    // what real chess puts there. Halving it is the correction evaluate() needs
+    // to keep consecutive plies from disagreeing by that bonus.
+    network->tempoCorrection = start / 2;
+
     return val[4] >= 300 && val[4] <= 2500;                         // and on a sane scale
 }
 } // namespace
@@ -567,6 +589,7 @@ bool consistent(const Accumulator& accumulator, const uint8_t board[64]) {
 }
 
 int evaluate(const Accumulator& accumulator, int sideToMove) {
-    return network ? infer(accumulator, sideToMove) : 0;
+    if (!network) return 0;
+    return infer(accumulator, sideToMove) - network->tempoCorrection;
 }
 } // namespace Nnue

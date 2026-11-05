@@ -57,5 +57,8 @@ void revert_update(Accumulator& dst, const Accumulator& src, const Update& updat
 void prefetch_update(const Update& update);
 void reset(Accumulator& accumulator, const uint8_t board[64]);
 bool consistent(const Accumulator& accumulator, const uint8_t board[64]);
+// Evaluation for the side to move, with the network's measured side-to-move bonus
+// reduced to a normal size so the score no longer flips by about a pawn between
+// consecutive plies.
 int evaluate(const Accumulator& accumulator, int sideToMove);
 } // namespace Nnue

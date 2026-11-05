@@ -11,14 +11,14 @@ list. `android/README.md` documents the protocol and how to import it.
 
 ## Download
 
-- [wall-e.tiny.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.6-android/wall-e.tiny.apk)
+- [wall-e.tiny.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.7-android/wall-e.tiny.apk)
   — one network (fingolfin), 2.2 MB.
-- [wall-e.strong.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.6-android/wall-e.strong.apk)
+- [wall-e.strong.apk](https://github.com/Tianl1234/Wall-e/releases/download/v1.3.7-android/wall-e.strong.apk)
   — three phase networks (fingolfin/finarfin/feanor), 5.9 MB.
 
-Both are versionCode 11 / versionName 1.3.6, signed with the same key as earlier
+Both are versionCode 12 / versionName 1.3.7, signed with the same key as earlier
 releases and upgrade in place. The same files are kept under versioned names in `apk/`
-(`Wall-E-engine-1.3.6.apk` and `Wall-E-engine-1.3.6-strong.apk`).
+(`Wall-E-engine-1.3.7.apk` and `Wall-E-engine-1.3.7-strong.apk`).
 
 ## Layout
 
@@ -67,6 +67,41 @@ could not compile for a phone. Three changes fix that without touching the searc
    each perspective's int16 accumulator with saturating SIMD operations (NEON on ARM64),
    rather than allocating and reducing a two-perspective int32 delta buffer on each move.
 5. **PIE.** Android requires position-independent executables; the NDK build produces one.
+
+## Changes in 1.3.7
+
+This release fixes the reason the evaluation bar travelled on its own while a game was
+being reviewed, and it applies to the tiny package as well as the strong one.
+
+- **The networks carry an oversized side-to-move term.** On the symmetric start position
+  the nets return about +1.1 pawns for whichever side is to move — fingolfin 112 cp,
+  finarfin 83, feanor 121, the same number from either perspective. Real chess puts
+  roughly +0.2 there. Negamax flips the sign of the score at every ply, so a position's
+  value depended on the parity of the search: it scored about a pawn higher when the net
+  was the side to move, which is what made the bar move between consecutive depths and
+  between consecutive reviewed moves while the position stood still.
+- **The excess is measured at load and subtracted.** `nnue.cpp` now probes each network on
+  the start board, where the score *is* that bonus, and stores half of it as
+  `Network::tempoCorrection` (56 cp for fingolfin, 41 for finarfin, 60 for feanor).
+  `evaluate()` returns `infer(...) - tempoCorrection`. The inference kernels, the feature
+  indexing and the network files are unchanged, and every network carries its own
+  constant, so phase-network switching stays correct.
+- **Measured effect** (start position, `Threads=2`, depths 1–16, white-relative). Before,
+  the score went −5, 112, 26, 103, 39, 119, 46, 92, 34, 88, 26, 92 — steps of up to
+  109 cp, with 8–11 of the 15 depth changes at or above 25 cp. It now reads 51, 59, 47, 49,
+  27, 46, 51, 65, 60, 61, 67, 80, 84, 71, 81: the largest step is 22 cp and at most two of
+  the 15 reach 25 cp. Reviewing a 40-move game at depth 12 moves the score by 24 cp on
+  average, and the remaining large steps line up with captures rather than with depth
+  parity.
+- **This is not a strength claim.** The network's evaluation is unchanged apart from the
+  constant; the start position simply reads 56 cp instead of 112, which is a normal
+  opening score. Because eval-dependent pruning now sees the lower number, `bench 12`
+  visits 1,153,781 nodes instead of 556,713 at the same speed (3.4 Mnps). No match was
+  played to measure the Elo effect.
+- **Checked on a host build from the same sources.** `perft 5` = 4,865,609, `verify 4` =
+  197,281 nodes with 0 inconsistent, a 40-move replay of the incremental accumulator
+  shows 0 inconsistencies, and the evaluation is identical between the AVX-512 build and
+  an SSE4.2 build with the runtime AVX2 dispatch that the x86_64 package uses.
 
 ## Changes in 1.3.6
 
@@ -231,10 +266,16 @@ could not compile for a phone. These changes fixed that without touching the sea
 ## Verification done here
 
 - Host build (`-march=znver5`, embedded networks, same sources as the APK): `perft 5` =
-  4,865,609, `verify 4` = 197,281 nodes with 0 inconsistent, `bench 12` = 556,713 nodes
-  in ~161 ms (3.5 Mnps). Before the qsearch table probe the same bench searched 665,358
-  nodes in ~164 ms, so the reduction costs no strength: a 16-game 60 ms match between the
-  two builds finished 7-7 with 4 draws.
+  4,865,609, `verify 4` = 197,281 nodes with 0 inconsistent, `bench 12` = 1,153,781 nodes
+  in ~339 ms (3.4 Mnps). The node count rose from 556,713 in 1.3.6 because the evaluation
+  now reports 56 cp instead of 112 in the start position (see 1.3.7), so eval-driven
+  pruning is less optimistic at unchanged speed. Before the qsearch table probe the same
+  bench searched 665,358 nodes in ~164 ms, so the reduction costs no strength: a 16-game
+  60 ms match between the two builds finished 7-7 with 4 draws.
+- Evaluation agrees across the shipped code paths: the AVX-512 build and an SSE4.2 build
+  with the runtime AVX2 dispatch used by the x86_64 package return identical scores on
+  the same positions, and `nnue.cpp`/`chess.cpp` compile for `arm64-v8a` and `x86_64` in
+  both the tiny and the strong variant with NDK 27.3.
 - Phase policy (1.3.6): start position and a 16-material-point middlegame auto-select
   fingolfin and give exactly the pinned-fingolfin scores; a 12-point endgame auto-selects
   finarfin and gives exactly the pinned-finarfin scores. The strong build loads all three
@@ -249,7 +290,7 @@ could not compile for a phone. These changes fixed that without touching the sea
   LOAD alignment 16 KiB, no text relocations, only `libc`/`libm`/`libdl` needed;
   the NEON kernels are present (`smull`/`smlal`, `sqadd`/`sqsub`, `addv`) and the
   network's bytes are inside the binary.
-- APK (1.3.6): versionCode 11 / versionName 1.3.6, minSdk 26, targetSdk 34,
+- APK (1.3.7): versionCode 12 / versionName 1.3.7, minSdk 26, targetSdk 34,
   `extractNativeLibs=true`, native code `arm64-v8a` + `x86_64`, **no launcher category**
   (so no icon), OEX activity/provider/enginelist present, `zipalign` and `apksigner`
   verify (v2 + v3). The embedded networks were compared byte-for-byte with
@@ -258,9 +299,10 @@ could not compile for a phone. These changes fixed that without touching the sea
   and packaging: `perft 5` = 4,865,609, `verify 4` = 197,281 nodes / 0 inconsistent,
   `bench 12` = 556,713 nodes in ~199 ms, a `Threads=4` depth-16 search completes, and the
   strong package loads all three networks and searches across a phase switch. This
-  exercises the x86_64 build, not the ARM64 NEON path. The 1.3.6 packages were not
-  re-run in WSA because its adb endpoint was unavailable at build time; their only engine
-  change is the phase policy verified on the host build above.
+  exercises the x86_64 build, not the ARM64 NEON path. The 1.3.6 and 1.3.7 packages were
+  not re-run in WSA because its adb endpoint was unavailable at build time; their engine
+  changes are the phase policy and the side-to-move correction, both verified on the host
+  build above.
 
 Build the current APK with `android/build_apk.sh`; rerun native and package checks after
 changes before quoting updated performance or APK checksum results.
